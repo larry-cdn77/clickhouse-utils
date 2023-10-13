@@ -1,8 +1,6 @@
 # Assorted ClickHouse Administrator's Utilities
 
-## Data Diff
-
-### Prerequisites
+### Common Prerequisites
 
 ClickHouse Driver library, eg:
 
@@ -10,25 +8,35 @@ ClickHouse Driver library, eg:
 pip3 install clickhouse_driver
 ```
 
-### Usage
+## Data Diff
+
+Usage:
+
+```shell
+data-diff CLUSTERS QUERY [TOLERANCE]
+```
+
+* CLUSTERS file line format: SHORT-NAME BOOTSTRAP-HOSTNAME (will add port 9000)
+* TOLERANCE specifies max allowed percentage deviation from mean of all clusters
+* QUERY returns a number and can use `origin' time fixed between clusters
+* output format: GOOD|BAD\<TAB\>SUMMARY\<TAB\>VALUES
 
 Example:
 
 ```shell
-diff-data ./clusters ./tables
+data-diff ./clusters ./tables
 ```
 
 ## SQL Diff
 
-### Prerequisites
-
-ClickHouse Driver library, eg:
+Usage:
 
 ```shell
-pip3 install clickhouse_driver
+sql-diff HOST FILE ...
 ```
 
-### Usage
+* One or more FILEs contain CREATE statements to diff against
+* HOST without port (will use 9000)
 
 Example:
 
@@ -36,13 +44,9 @@ Example:
 sql-diff clickhouse.local tables/*.sql
 ```
 
-### Limitations
+Inspired by ClickHouse PlantUML
+
+Limitations:
 
 Almost any ClickHouse feature you can imagine is unsupported, you have been
-warned
-
-With that said, the little there is has proven useful
-
-### References
-
-Inspired by ClickHouse PlantUML
+warned. With that said, the little there is has proven useful.
