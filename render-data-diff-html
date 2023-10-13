@@ -1,0 +1,23 @@
+#!/usr/bin/python3
+import sys
+
+result = {}
+for line in sys.stdin:
+    split = line.strip().split('\t')
+    if len(split) >= 4 and split[0][0] != '#':
+        table, interval, stat, summary = split[0:4]
+        if table not in result:
+            result[table] = {}
+        result[table][interval] = (stat, summary)
+
+def escape(s): # allow escape sequences for fancy like the Greek alphabet
+    return s.replace('<', '&lt;').replace('>', '&gt;')
+
+print('<table>')
+for table, d in result.items():
+    print('<tr><td/><td>' + '</td><td>'.join(d.keys()) + '</td></tr>')
+    print('<tr><td>' + table + '</td>')
+    for interval, (stat, summary) in d.items():
+        print('<td class="%s">%s</td>' % (stat, escape(summary)))
+    print('</tr>')
+print('</table>')

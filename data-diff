@@ -1,0 +1,82 @@
+#!/usr/bin/python3
+import datetime
+import os
+import statistics
+import sys
+import time
+
+import clickhouse_driver
+
+__version__ = '0.3'
+
+def resolve(absolute, tolerance):
+    keys, values = list(absolute.keys()), list(absolute.values())
+    zeroes = values.count(0)
+    mean = statistics.mean(values)
+
+    if zeroes == len(absolute):
+        return [0, '0 *']
+    elif zeroes > 0:
+        return [1, '0 ' + ','.join([shortname \
+            for shortname, returned in absolute.items() if returned == 0])]
+    else:
+        summary = []
+        for shortname, returned in absolute.items():
+            if returned < mean * (1 - tolerance / 100.0): # ...and individual dev.
+                summary += [shortname + '<M']
+            elif returned > mean * (1 + tolerance / 100.0):
+                summary += [shortname + '>M']
+        if len(summary) == 0:
+            return [0, '='.join(keys)]
+        else:
+            return [1, ','.join(summary)]
+
+def diff(origin, query, clusters, tolerance):
+    absolute = {}
+    for shortname, cluster in clusters.items():
+        whole_query = \
+            ('WITH toStartOfHour(toDateTime(%d)) AS origin ' % origin) + query
+        print(whole_query, file=sys.stderr)
+        start = datetime.datetime.now()
+        try:
+            for (returned,) in cluster.execute(whole_query): # first row
+                break
+        except clickhouse_driver.errors.ServerException as e:
+                if e.code in [
+                    clickhouse_driver.errors.ErrorCodes.UNKNOWN_DATABASE,
+                    clickhouse_driver.errors.ErrorCodes.UNKNOWN_TABLE]:
+                    returned = 0
+                else:
+                    raise e
+        print('took %d sec' % \
+            (datetime.datetime.now() - start).total_seconds(), \
+            file=sys.stderr)
+        absolute[shortname] = returned
+    return resolve(absolute, tolerance), absolute
+
+def __main__():
+    if len(sys.argv) not in [3, 4]:
+        print('''usage: data-diff CLUSTERS QUERY [TOLERANCE]
+
+- CLUSTERS file line format: SHORT-NAME BOOTSTRAP-HOSTNAME (will add port 9000)
+- TOLERANCE specifies max allowed percentage deviation from mean of all clusters
+- QUERY returns a number and can use `origin' time fixed between clusters
+- output format: GOOD|BAD<TAB>SUMMARY<TAB>VALUES
+''')
+        sys.exit(2)
+    clusters = {}
+    tolerance = float(sys.argv[3]) if len(sys.argv) == 4 else 0.5
+    origin = time.time()
+    with open(sys.argv[1]) as f:
+        for line in f:
+            split = line.strip().split(' ')
+            if len(split) != 2:
+                raise Exception('bad line: ' + line)
+            clusters[split[0]] = clickhouse_driver.Client(
+                host=split[1], port=9000, user='default', password='')
+
+    query = sys.argv[2]
+    (stat, summary), absolute = diff(origin, query, clusters, tolerance)
+    print('%s\t%s\t%s' % ('GOOD' if stat == 0 else 'BAD', summary, absolute))
+
+__main__()

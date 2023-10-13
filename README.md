@@ -1,5 +1,23 @@
 # Assorted ClickHouse Administrator's Utilities
 
+## Data Diff
+
+### Prerequisites
+
+ClickHouse Driver library, eg:
+
+```shell
+pip3 install clickhouse_driver
+```
+
+### Usage
+
+Example:
+
+```shell
+diff-data ./clusters ./tables
+```
+
 ## SQL Diff
 
 ### Prerequisites
@@ -28,4 +46,3 @@ With that said, the little there is has proven useful
 ### References
 
 Inspired by ClickHouse PlantUML
-
