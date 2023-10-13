@@ -1,0 +1,956 @@
+#!/usr/bin/python3
+import difflib
+import io
+import re
+import sqlparse
+import sys
+import token
+import tokenize
+
+import clickhouse_driver
+
+__version__ = '0.1.4'
+
+sqlparse_format = {
+    'strip_comments': True,
+    'use_space_around_operators': False
+}
+
+def untokenize(s, t):
+    '''
+    own tokenize.untokenize to work around:
+
+    - strange newlines in output of untokenize appeared when a list of whole
+      token tuples is passed to it instead of a type/string pair (even though
+      documentation stated that 'any additional sequence elements are
+      ignored')
+
+    - joining does not recover whitespace properly, token strings get
+      squashed (documentation said 'the result is guaranteed to tokenize
+      back to match the input so that the conversion is lossless and
+      round-trips are assured')
+
+    specialised to continuous sequence of token positions, ie take everything
+    from start of first token to end of last token
+    '''
+    if len(t) == 0:
+        return ''
+
+    u = ''
+    row = 1
+    (srow, scol) = t[0].start
+    (erow, ecol) = t[-1].end
+    for line in s.split('\n'):
+        if row == srow:
+            if row == erow:
+                u += line[scol:ecol] + ' '
+            else:
+                u += line[scol:] + ' '
+        elif row > srow and row < erow:
+            u += line + ' '
+        elif row == erow:
+            u += line[:ecol] + ' '
+        row += 1
+
+    # some extra postprocessing for clean comparison
+    return u.replace('( ', '(').replace(' )', ')').strip()
+
+def expand_scientific(s):
+    '''
+    '5e+3' -> '5000.'
+    '''
+    if s.find('e+') > 0:
+        return '%.0f.' % float(s)
+    else:
+        return s
+
+def preview_diff(a, b):
+    def clip(s):
+        if len(s) > 80:
+            return s[0:76] + '...' + s[-1]
+        else:
+            return s
+    matcher = difflib.SequenceMatcher(None, a, b)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'insert':
+            return clip('+ "%s"' % b[j1:j2])
+        elif tag == 'delete':
+            return clip('- "%s"' % a[i1:i2])
+        elif tag == 'replace':
+            return clip('"%s" -> "%s"' % (a[i1:i2], b[j1:j2]))
+    return ''
+
+###############################################################################
+class Client(clickhouse_driver.Client):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def execute_clickhouse_tables_sql_tokens(self, dbname, column):
+        (value,) = \
+            self.execute('''SELECT
+            %s FROM system.tables WHERE database == '%s' AND name = '%s'
+            ''' % ((column,) + tuple(dbname.split('.'))))[0]
+
+        formatted = sqlparse.format(value, **sqlparse_format)
+        return formatted, \
+            list(tokenize.generate_tokens(io.StringIO(formatted).readline))
+
+###############################################################################
+class Table(object):
+    def __init__(self, engine, dbname):
+        self.engine = engine
+        self.dbname = dbname
+        self.columns = []
+
+    def _parse_columns(self, s, t):
+        state = 0 # 1 = in outer brackets, 2 = in column, 3 = done
+        level = 0
+        column = []
+        for x in t:
+            if x.exact_type == token.LPAR:
+                level += 1
+                if level == 1:
+                    continue
+            elif x.exact_type == token.RPAR:
+                level -= 1
+                if level == 0:
+                    self.columns += [untokenize(s, column)]
+                    column = []
+                    break
+            elif x.exact_type == token.COMMA:
+                if level == 1:
+                    self.columns += [untokenize(s, column)]
+                    column = []
+                    continue
+            if level >= 1:
+                column += [x]
+
+        # work around what appear untokenize including backquotes presumably
+        # as it considers them parsing errors (ERRORTOKEN)
+        for i in range(len(self.columns)):
+            self.columns[i] = self.columns[i].replace('`', '')
+
+    def diff(self, other):
+        if self.engine != other.engine:
+            return ['engine: %s, %s' % (self.engine, other.engine)]
+
+        if len(self.columns) > 0 and len(other.columns) > 0:
+            diff = list(difflib.unified_diff(sorted(self.columns),
+                sorted(other.columns), n=0, lineterm=''))
+            if len(diff) > 0:
+                return ['columns: ' + ' '.join(diff)]
+
+        return []
+
+    def __str__(self):
+        return '%s %s' % (self.engine, self.dbname)
+
+###############################################################################
+class MT(Table):
+    '''
+    MergeTree engine family
+
+    check engine, columns, TTL, settings, partitioning key and sorting key
+    '''
+    def __init__(self, dbname, engine):
+        super().__init__(engine, dbname)
+
+        self.ttl = ''
+        self.settings = {}
+        self.partition_key = ''
+        self.sorting_key = ''
+
+    def _parse_engine(self, s, t):
+        state = 0 # 1 = MergeTree, 2 = TTL, 3 = SETTINGS
+        setting = ''
+        ttl = []
+        for x in t:
+            if x.type == token.NAME:
+                if x.string.endswith('MergeTree'): # heuristic to skip column settings
+                    state = 1
+                    continue
+                elif state == 0:
+                    continue
+                elif x.string == 'TTL':
+                    state = 2
+                    continue
+                elif x.string == 'SETTINGS':
+                    state = 3
+                    continue
+                elif x.string in ['PARTITION', 'ORDER', 'PRIMARY']:
+                    state = 1 # quick & dirty heuristic to end TTL/SETTINGS clause
+                else:
+                    if state == 2:
+                        if x.string != 'DELETE': # system.tables omits DELETE
+                            ttl += [x]
+                    elif state == 3:
+                        if setting == '':
+                            setting = x.string
+                        else:
+                            self.settings[setting] = '%s=%s' % (setting, x.string)
+                            setting = ''
+            else:
+                if state == 2:
+                    ttl += [x]
+                elif state == 3:
+                    if x.exact_type not in [
+                        token.EQUAL, token.COMMA, token.ENDMARKER, token.NEWLINE]:
+                        self.settings[setting] = '%s=%s' % (setting, expand_scientific(x.string))
+                        setting = ''
+
+        self.ttl = untokenize(s, ttl)
+
+        # heuristic: default index_granularity in ClickHouse engine SQL
+        if 'index_granularity' in self.settings:
+            del self.settings['index_granularity']
+
+        state = 0 # 1,2 = PARTITION (BY), 3,4 = ORDER (BY)
+        partition_key, sorting_key = [], []
+        for x in t:
+            if x.type == token.NAME:
+                if x.string == 'PARTITION':
+                    state = 1
+                elif x.string == 'ORDER':
+                    state = 3
+                elif x.string == 'BY':
+                    if state == 1:
+                        state = 2
+                        continue
+                    elif state == 3:
+                        state = 4
+                        continue
+                    else:
+                        state = 0
+                elif x.string in ['TTL', 'SETTINGS', 'KEY', 'PRIMARY']:
+                    state = 0 # quick & dirty heuristic
+            if state == 2:
+                partition_key += [x]
+            elif state == 4:
+                sorting_key += [x]
+
+        self.partition_key = untokenize(s, partition_key)
+        self.sorting_key = untokenize(s, sorting_key)
+
+    def scan(self, client):
+        self._parse_engine(*client.execute_clickhouse_tables_sql_tokens(
+            self.dbname, 'engine_full'))
+
+        self._parse_columns(*client.execute_clickhouse_tables_sql_tokens(
+            self.dbname, 'create_table_query'))
+
+        return self
+
+    def read(self, s, t):
+        self._parse_engine(s, t)
+        self._parse_columns(s, t)
+
+        return self
+
+    def diff(self, other):
+        ret = super().diff(other)
+        if len(ret) > 0:
+            return ret
+
+        if self.ttl != other.ttl:
+            ret += ['TTL ("%s" "%s")' % (self.ttl, other.ttl)]
+
+        #ret += ['["%s", "%s"]' % (self.settings.values(), other.settings.values())]
+        for setting in set(self.settings.values()) ^ set(other.settings.values()):
+            if setting.startswith('storage_policy'):
+                ret += ['storage policy']
+            else:
+                ret += [setting]
+
+        if self.partition_key != other.partition_key:
+            ret += ['partitioning ("%s" -> "%s")' % \
+                (self.partition_key, other.partition_key)]
+
+        if self.sorting_key != other.sorting_key:
+            ret += ['sorting ("%s" "%s")' % (self.sorting_key, other.sorting_key)]
+
+        return ret
+
+    def __str__(self):
+        return \
+            '%s TTL %s SETTINGS %s PARTITION BY %s ORDER BY %s' % \
+            (str(super()),
+             self.ttl,
+             ','.join(self.settings.values()),
+             self.partition_key,
+             self.sorting_key)
+
+###############################################################################
+class MV(Table):
+    '''
+    MaterializedView engine
+
+    check select statement, source table and destionation tables
+    '''
+    def __init__(self, dbname):
+        super().__init__('MaterializedView', dbname)
+
+        self.as_select = ''
+        self.to = ''
+        self.fr = ''
+
+    def _parse_create_query(self, s, t):
+        state = 0 # 1 = TO, 2 = full-stop, 3 = FROM, 4 = full stop
+        fr, to = [], []
+        for x in t:
+            if state == 0:
+                if x.type == token.NAME:
+                    if x.string == 'TO':
+                        state = 1
+                    elif x.string == 'FROM':
+                        state = 3
+                        fr = [] # reset to capture last of multiple 'FROM'
+            elif state == 1:
+                if x.type == token.NAME:
+                    if len(to) == 0:
+                        to = [x.string]
+                    else:
+                        state = 0
+                elif x.exact_type == token.DOT:
+                    state = 2
+            elif state == 2:
+                if x.type == token.NAME:
+                    if len(to) == 1:
+                        to += [x.string]
+                state = 0
+            elif state == 3:
+                if x.type == token.NAME:
+                    if len(fr) == 0:
+                        fr = [x.string]
+                    else:
+                        state = 0
+                elif x.exact_type == token.DOT:
+                    state = 4
+            elif state == 4:
+                if x.type == token.NAME:
+                    if len(fr) == 1:
+                        fr += [x.string]
+                state = 0
+
+        if len(to) == 1:
+            self.to = 'default.%s' % to[0]
+        else:
+            self.to = '%s.%s' % (to[0], to[1])
+        if len(fr) == 1:
+            self.fr = 'default.%s' % fr[0]
+        else:
+            self.fr = '%s.%s' % (fr[0], fr[1])
+        #print('+', self.fr, self.to, '"%s"' % s)
+
+        state = 0 # 1 = seen first AS, 2 = seen SELECT after AS
+        as_select = []
+        for x in t:
+            if state == 0:
+                if x.type == token.NAME and x.string == 'AS':
+                    state = 1
+            elif state == 1:
+                if x.type == token.NAME and x.string == 'SELECT':
+                    state = 2
+                    as_select += [x]
+                else:
+                    state = 0
+            elif state == 2:
+                as_select += [x]
+
+        self.as_select = untokenize(s, as_select)
+
+        # heuristic: remove explicit 'default.' in from-table
+        self.as_select = re.sub(r'FROM [a-zA-Z0-9_]*\.', 'FROM ', self.as_select)
+
+    def scan(self, client):
+        self._parse_create_query(*client.execute_clickhouse_tables_sql_tokens(
+            self.dbname, 'create_table_query'))
+
+        return self
+
+    def read(self, s, t):
+        self._parse_create_query(s, t)
+        return self
+
+    def diff(self, other):
+        ret = super().diff(other)
+        if len(ret) > 0:
+            return ret
+
+        if self.as_select != other.as_select:
+            s = preview_diff(self.as_select, other.as_select)
+            #s = '["%s", "%s"]' % (self.as_select, other.as_select)
+            if len(s) > 0:
+                s = ' (%s)' % s
+            ret += ['AS SELECT statement%s' % s]
+
+        if self.to != other.to:
+            ret += ['TO table']
+
+        if self.fr != other.fr:
+            ret += ['FROM table']
+
+        return ret
+
+    def __str__(self):
+        return \
+            '%s TO %s AS %s (FROM %s)' % \
+            (str(super()),
+             self.to,
+             self.as_select,
+             self.fr)
+
+###############################################################################
+class Buffer(Table):
+    '''
+    Buffer engine
+    
+    check engine parameters, target database and table (from engine arguments)
+    '''
+    def __init__(self, dbname):
+        super().__init__('Buffer', dbname)
+
+        self.to = None
+        self.parameters = {}
+
+    def _parse_engine(self, s, t):
+        state = 0 # 1 = (, 2 = first comma, 3 = second comma
+        db, name = 'default', '' # default when currentDatabase() used
+        index = 0
+        for x in t:
+            if x.exact_type == token.LPAR:
+                if state == 0:
+                    state = 1
+            elif x.exact_type == token.COMMA:
+                if state in [1, 2]:
+                    state += 1
+            elif x.type == token.STRING:
+                if state == 1:
+                    db = eval(x.string)
+                elif state == 2:
+                    name = eval(x.string)
+            elif x.type == token.NUMBER:
+                if state == 3:
+                    self.parameters[index] = expand_scientific(x.string)
+                    index += 1
+
+        #print('+', '%s.%s' % (db, name), '"%s"' % s)
+        self.to = '%s.%s' % (db, name)
+
+    def scan(self, client):
+        self._parse_engine(*client.execute_clickhouse_tables_sql_tokens(
+            self.dbname, 'engine_full'))
+
+        return self
+
+    def read(self, s, t):
+        self._parse_engine(s, t)
+        return self
+
+    def diff(self, other):
+        ret = super().diff(other)
+        if len(ret) > 0:
+            return ret
+
+        if self.to != other.to:
+            ret += ['TO table']
+
+        if set(self.parameters.items()) ^ set(other.parameters.items()):
+            ret += ['parameters']
+
+        return ret
+
+    def __str__(self):
+        return \
+            '%s TO %s (%s)' % \
+            (str(super()),
+             self.to,
+             ','.join(self.parameters.values()))
+
+###############################################################################
+class Dist(Table):
+    '''
+    Distributed engine
+
+    check source database and table from engine arguments
+    '''
+    def __init__(self, dbname):
+        super().__init__('Dist', dbname)
+
+        self.fr = ''
+
+    def _parse_engine(self, s, t):
+        state = 0 # 1 = (, 2 = first comma, 3 = second comma
+        db, name = 'default', '' # default when currentDatabase() used
+        for x in t:
+            if x.exact_type == token.LPAR:
+                if state == 0:
+                    state = 1
+            elif x.exact_type == token.COMMA:
+                if state in [1, 2]:
+                    state += 1
+            elif x.type == token.STRING:
+                if state == 2:
+                    db = eval(x.string)
+                elif state == 3:
+                    name = eval(x.string)
+
+        #print('+', '%s.%s' % (db, name), '"%s"' % s)
+        self.fr = '%s.%s' % (db, name)
+
+    def scan(self, client):
+        self._parse_engine(*client.execute_clickhouse_tables_sql_tokens(
+            self.dbname, 'engine_full'))
+
+        return self
+
+    def read(self, s, t):
+        self._parse_engine(s, t)
+        return self
+
+    def diff(self, other):
+        ret = super().diff(other)
+        if len(ret) > 0:
+            return ret
+
+        if self.fr != other.fr:
+            ret += ['FROM table']
+
+        return ret
+
+    def __str__(self):
+        return \
+            '%s FROM %s' % \
+            (str(super()),
+             self.fr)
+
+###############################################################################
+class Null(Table):
+    '''
+    Null engine
+
+    check columns
+    '''
+    def __init__(self, dbname):
+        super().__init__('Null', dbname)
+
+    def scan(self, client):
+        self._parse_columns(*client.execute_clickhouse_tables_sql_tokens(
+            self.dbname, 'create_table_query'))
+
+        return self
+
+    def read(self, s, t):
+        self._parse_columns(s, t)
+        return self
+
+    def diff(self, other):
+        ret = super().diff(other)
+        if len(ret) > 0:
+            return ret
+
+        return ret
+
+    def __str__(self):
+        return str(super())
+
+###############################################################################
+class TinyLog(Table):
+    '''
+    TinyLog engine
+
+    check columns
+    '''
+    def __init__(self, dbname):
+        super().__init__('TinyLog', dbname)
+
+    def scan(self, client):
+        self._parse_columns(*client.execute_clickhouse_tables_sql_tokens(
+            self.dbname, 'create_table_query'))
+
+        return self
+
+    def read(self, s, t):
+        self._parse_columns(s, t)
+        return self
+
+    def diff(self, other):
+        ret = super().diff(other)
+        if len(ret) > 0:
+            return ret
+
+        return ret
+
+    def __str__(self):
+        return str(super())
+
+###############################################################################
+class KeeperMap(Table):
+    '''
+    KeeperMap engine
+
+    check columns and node path
+    '''
+    def __init__(self, dbname):
+        super().__init__('KeeperMap', dbname)
+
+        self.node_path = ''
+
+    def _parse_engine(self, s, t):
+        node_path = ''
+        for x in t:
+            if x.type == token.STRING:
+                if node_path == '': # heuristic on first string encountered
+                    node_path = eval(x.string)
+
+        self.node_path = node_path
+
+    def scan(self, client):
+        self._parse_engine(*client.execute_clickhouse_tables_sql_tokens(
+            self.dbname, 'engine_full'))
+
+        self._parse_columns(*client.execute_clickhouse_tables_sql_tokens(
+            self.dbname, 'create_table_query'))
+
+        return self
+
+    def read(self, s, t):
+        self._parse_engine(s, t)
+        self._parse_columns(s, t)
+        return self
+
+    def diff(self, other):
+        ret = super().diff(other)
+        if len(ret) > 0:
+            return ret
+
+        if self.node_path != other.node_path:
+            ret += ['node path: %s, %s' % (self.node_path, other.node_path)]
+
+        return ret
+
+    def __str__(self):
+        return str(super())
+
+###############################################################################
+class Dictionary(Table):
+    '''
+    Dictionary engine
+
+    check columns, primary key, source, layout and lifetime
+    '''
+    def __init__(self, dbname):
+        super().__init__('Dictionary', dbname)
+
+        self.primary_key = ''
+        self.source = ''
+        self.layout = ''
+        self.lifetime = ''
+
+    def _parse_lifetime(self, s, t):
+        state = 0 # 1 = (, 2 = number, 3 = MIN, 4 = MAX, 5 = )
+        pmin, pmax = 0, 0
+        for x in t:
+            if x.type == token.NAME:
+                if x.string == 'MIN':
+                    if state == 1:
+                        state = 3
+                        continue
+                elif x.string == 'MAX':
+                    if state == 3:
+                        state = 4
+                        continue
+            elif x.type == token.NUMBER:
+                if state == 1:
+                    pmax = eval(x.string)
+                    state = 2
+            elif x.exact_type == token.LPAR:
+                if state == 0:
+                    state = 1
+                    continue
+            elif x.exact_type == token.RPAR:
+                if state == 2 or state == 4:
+                    state = 5
+                    continue
+            if state == 3:
+                pmin = eval(x.string)
+            elif state == 4:
+                pmax = eval(x.string)
+        return [pmin, pmax]
+
+    def _parse_source(self, s, t):
+        state = 0 # 1 = CLICKHOUSE, 2 = (, 3 = DB, 4 = TABLE, 5 = )
+        chdb, chtable = '', ''
+        for x in t:
+            if x.type == token.NAME:
+                if x.string == 'CLICKHOUSE':
+                    if state == 0:
+                        state = 1
+                        continue
+                elif x.string == 'DB':
+                    if state == 2 or state == 4:
+                        state = 3
+                        continue
+                elif x.string == 'TABLE':
+                    if state == 2 or state == 3:
+                        state = 4
+                        continue
+            elif x.exact_type == token.LPAR:
+                if state == 1:
+                    state = 2
+            elif x.exact_type == token.RPAR:
+                if state == 3 or state == 4:
+                    state = 5
+            if state == 3:
+                chdb = eval(x.string)
+            elif state == 4:
+                chtable = eval(x.string)
+        if len(chdb) > 0 and len(chtable) > 0:
+            return "CLICKHOUSE(DB '%s' TABLE '%s')" % (chdb, chtable)
+        else: # incomplete ClickHouse source or other source
+            return untokenize(s, t) # use whole text including SOURCE
+
+    def _parse_create_query(self, s, t):
+        state = 0 # 1 = PRIMARY, 2 = KEY, 3 = SOURCE, 4 = LAYOUT, 5 = LIFETIME
+        primary_key, source, layout, lifetime = [], [], [], []
+        for x in t:
+            if x.type == token.NAME:
+                if x.string == 'PRIMARY':
+                    state = 1
+                elif x.string == 'KEY':
+                    if state == 1:
+                        state = 2
+                        continue
+                    else:
+                        state = 0
+                elif x.string == 'SOURCE':
+                    state = 3
+                elif x.string == 'LAYOUT':
+                    state = 4
+                elif x.string == 'LIFETIME':
+                    state = 5
+            if state == 2:
+                primary_key += [x]
+            elif state == 3:
+                source += [x]
+            elif state == 4:
+                layout += [x]
+            elif state == 5:
+                lifetime += [x]
+
+        self.primary_key = untokenize(s, primary_key)
+        self.source = self._parse_source(s, source)
+        self.layout = untokenize(s, layout)
+        self.lifetime = self._parse_lifetime(s, lifetime)
+
+    def scan(self, client):
+        (s, t) = client.execute_clickhouse_tables_sql_tokens(
+            self.dbname, 'create_table_query')
+
+        self._parse_create_query(s, t)
+        self._parse_columns(s, t)
+        return self
+
+    def read(self, s, t):
+        self._parse_create_query(s, t)
+        self._parse_columns(s, t)
+        return self
+
+    def diff(self, other):
+        ret = super().diff(other)
+        if len(ret) > 0:
+            return ret
+
+        if self.primary_key != other.primary_key:
+            ret += ['primary key']
+
+        if self.source != other.source:
+            ret += ['source']
+
+        if self.layout != other.layout:
+            ret += ['layout']
+
+        if self.lifetime[0] != other.lifetime[0] or \
+            self.lifetime[1] != other.lifetime[1]:
+            ret += ['lifetime']
+
+        return ret
+
+    def __str__(self):
+        return \
+            '%s %s' % \
+            (self.engine,
+             self.dbname)
+
+###############################################################################
+class Model(object):
+    def __init__(self):
+        self.mt = {}
+        self.mv = {}
+        self.buffer = {}
+        self.dist = {}
+        self.null = {}
+
+    def all_tables(self):
+        return self.mt | self.mv | self.buffer | self.dist | self.null
+
+    def _scan_table(self, client, dbname):
+        for (engine,) in client.execute('''SELECT engine FROM system.tables
+            WHERE database == '%s' AND name = '%s'
+            ''' % tuple(dbname.split('.'))):
+            if engine.endswith('MergeTree'):
+                self.mt[dbname] = MT(dbname, engine).scan(client)
+            elif engine == 'MaterializedView':
+                self.mv[dbname] = MV(dbname).scan(client)
+            elif engine == 'Buffer':
+                self.buffer[dbname] = Buffer(dbname).scan(client)
+            elif engine == 'Distributed':
+                self.dist[dbname] = Dist(dbname).scan(client)
+            elif engine == 'Null':
+                self.null[dbname] = Null(dbname).scan(client)
+            elif engine == 'TinyLog':
+                self.null[dbname] = TinyLog(dbname).scan(client)
+            elif engine == 'KeeperMap':
+                self.null[dbname] = KeeperMap(dbname).scan(client)
+            elif engine == 'Dictionary':
+                self.null[dbname] = Dictionary(dbname).scan(client)
+            else:
+                print('warning: %s: ignore unrecognised engine: %s' % (dbname, engine))
+
+    def _scan_tables(self, client, db):
+        for (table,) in client.execute('SHOW TABLES FROM %s' % db):
+            self._scan_table(client, '%s.%s' % (db, table))
+
+    def _scan_databases(self, client):
+        for (db,) in client.execute('SHOW DATABASES'):
+            if db not in ['information_schema', 'INFORMATION_SCHEMA', 'system']:
+                self._scan_tables(client, db)
+
+    def _verify_dependencies(self):
+        for dbname, mv in self.mv.items():
+            if mv.fr not in (self.mt | self.null):
+                print('warning: %s from-table %s not found amongst known MergeTree and Null' % \
+                  (dbname, mv.fr))
+            if mv.to not in (self.mt | self.null):
+                print('warning: %s to-table %s not found amogst known running MergeTree and Null' % \
+                  (dbname, mv.to))
+
+    def scan(self, client):
+        self._scan_databases(client)
+
+        self._verify_dependencies()
+        return self
+    
+    def _preprocess(self, statement):
+        # formatted
+        s = sqlparse.format(statement, **sqlparse_format)
+
+        # without trailing semicolons
+        s = s.rstrip(';')
+
+        # whitespace collapsed
+        s = re.sub(r'\s+', ' ', s.strip())
+
+        s = s.replace(' IF NOT EXISTS ', ' ')
+
+        return s
+
+    def _read_dbname(self, t):
+        if t[1].exact_type == token.DOT:
+            return '%s.%s' % (t[0].string, t[2].string)
+        else:
+            return 'default.%s' % t[0].string
+
+    def _read_engine(self, t):
+        state = 0 # 1 = seen ENGINE, 2 = seen equal sign
+        for x in t:
+            if state == 0:
+                if x.string == 'ENGINE':
+                    state = 1
+            elif state == 1:
+                if x.exact_type == token.EQUAL:
+                    state = 2
+                else:
+                    state = 0
+            elif state == 2:
+                return x.string
+        return None
+
+    def _read_create_statement(self, s, t):
+        if t[1].string == 'MATERIALIZED' and t[2].string == 'VIEW':
+            dbname = self._read_dbname(t[3:])
+            engine = 'MaterializedView'
+        elif t[1].string == 'DICTIONARY':
+            dbname = self._read_dbname(t[2:])
+            engine = 'Dictionary'
+        elif t[1].string == 'TABLE':
+            dbname = self._read_dbname(t[2:])
+            engine = self._read_engine(t)
+        else:
+            return
+
+        if engine.endswith('MergeTree'):
+            self.mt[dbname] = MT(dbname, engine).read(s, t)
+        elif engine == 'MaterializedView':
+            self.mv[dbname] = MV(dbname).read(s, t)
+        elif engine == 'Buffer':
+            self.buffer[dbname] = Buffer(dbname).read(s, t)
+        elif engine == 'Distributed':
+            self.dist[dbname] = Dist(dbname).read(s, t)
+        elif engine == 'Null':
+            self.null[dbname] = Null(dbname).read(s, t)
+        elif engine == 'TinyLog':
+            self.null[dbname] = TinyLog(dbname).read(s, t)
+        elif engine == 'KeeperMap':
+            self.null[dbname] = KeeperMap(dbname).read(s, t)
+        elif engine == 'Dictionary':
+            self.null[dbname] = Dictionary(dbname).read(s, t)
+
+    def _read_statement(self, s, t):
+        if t[0].string == 'CREATE':
+            self._read_create_statement(s, t)
+
+    def read(self, files):
+        for file in files:
+            with open(file) as fd:
+                for statement in sqlparse.split(fd.read()):
+                    s = self._preprocess(statement)
+                    self._read_statement(s,
+                        list(tokenize.generate_tokens(io.StringIO(s).readline)))
+
+        return self
+
+    def __str__(self):
+        return '\n'.join([str(x) for x in self.all_tables().values()])
+
+###############################################################################
+def __main__():
+    if len(sys.argv) < 3:
+        print('''usage: sql-diff HOST FILE ...
+one or more FILEs contain CREATE statements to diff against
+port number in HOST is excluded (9000 will be used)''')
+        sys.exit(2)
+
+    live = Model().scan(Client(
+        host=sys.argv[1],
+        port=9000,
+        user='default', password=''))
+
+    repo = Model().read(sys.argv[2:])
+
+    for tl in live.all_tables().values():
+        print('%-40s' % tl.dbname, end='')
+
+        try:
+            tf = repo.all_tables()[tl.dbname]
+        except KeyError:
+            print('no such table found in files')
+            continue
+
+        ret = tf.diff(tl)
+        if len(ret) > 0:
+            print(', '.join(ret))
+            continue
+
+        print('OK')
+
+__main__()
