@@ -8,6 +8,17 @@ ClickHouse Driver library, eg:
 pip3 install clickhouse_driver
 ```
 
+## Active Tables
+
+Usage:
+
+```shell
+./active-tables clickhouse.local
+```
+
+Prints out data flows of recent insert queries based on Buffer engine and
+Materialized View dependencies
+
 ## Data Diff
 
 Usage:

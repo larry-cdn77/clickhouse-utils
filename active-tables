@@ -1,0 +1,161 @@
+#!/usr/bin/python3
+import io
+import sqlparse
+import sys
+import token
+import tokenize
+
+import clickhouse_driver
+
+__version__ = '0.1'
+
+class Client(clickhouse_driver.Client):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def execute_clickhouse_tables_sql_tokens(self, dbname, column):
+        (value,) = \
+            self.execute('''SELECT
+            %s FROM system.tables WHERE database == '%s' AND name = '%s'
+            ''' % ((column,) + tuple(dbname.split('.'))))[0]
+
+        sqlparse_format = {
+            'strip_comments': True,
+            'use_space_around_operators': False
+        }
+        formatted = sqlparse.format(value, **sqlparse_format)
+        return formatted, \
+            list(tokenize.generate_tokens(io.StringIO(formatted).readline))
+
+###############################################################################
+
+def get_all_materialized_views(c):
+    ret = {}
+    for (dbname,) in c.execute('''
+        SELECT database || '.' || name
+        FROM system.tables WHERE engine = 'MaterializedView'
+        '''):
+
+        (s, t) = \
+            c.execute_clickhouse_tables_sql_tokens(dbname, 'create_table_query')
+
+        state = 0 # 1 = TO, 2 = full-stop, 3 = FROM, 4 = full stop
+        fr, to = [], []
+        for x in t:
+            if state == 0:
+                if x.type == token.NAME:
+                    if x.string == 'TO':
+                        state = 1
+                    elif x.string == 'FROM':
+                        state = 3
+                        fr = [] # reset to capture last of multiple 'FROM'
+            elif state == 1:
+                if x.type == token.NAME:
+                    if len(to) == 0:
+                        to = [x.string]
+                    else:
+                        state = 0
+                elif x.exact_type == token.DOT:
+                    state = 2
+            elif state == 2:
+                if x.type == token.NAME:
+                    if len(to) == 1:
+                        to += [x.string]
+                state = 0
+            elif state == 3:
+                if x.type == token.NAME:
+                    if len(fr) == 0:
+                        fr = [x.string]
+                    else:
+                        state = 0
+                elif x.exact_type == token.DOT:
+                    state = 4
+            elif state == 4:
+                if x.type == token.NAME:
+                    if len(fr) == 1:
+                        fr += [x.string]
+                state = 0
+
+        if len(fr) == 1:
+            fr_str = 'default.%s' % fr[0]
+        else:
+            fr_str = '%s.%s' % (fr[0], fr[1])
+        if len(to) == 1:
+            to_str = 'default.%s' % to[0]
+        else:
+            to_str = '%s.%s' % (to[0], to[1])
+        
+        ret[dbname] = (fr_str, to_str)
+    return ret
+
+def get_all_buffer_tables(c):
+    ret = {}
+    for (dbname,) in c.execute('''
+        SELECT database || '.' || name
+        FROM system.tables WHERE engine = 'Buffer'
+        '''):
+
+        (s, t) = \
+            c.execute_clickhouse_tables_sql_tokens(dbname, 'engine_full')
+
+        state = 0 # 1 = (, 2 = first comma, 3 = second comma (unused)
+        db, name = 'default', '' # default when currentDatabase() used
+        index = 0
+        for x in t:
+            if x.exact_type == token.LPAR:
+                if state == 0:
+                    state = 1
+            elif x.exact_type == token.COMMA:
+                if state in [1, 2]:
+                    state += 1
+            elif x.type == token.STRING:
+                if state == 1:
+                    db = eval(x.string)
+                elif state == 2:
+                    name = eval(x.string)
+
+        ret[dbname] = '%s.%s' % (db, name)
+
+    return ret
+
+def get_recent_insert_tables(c):
+    INSERT_MAX_AGE_MINUTES = 30
+    ret = {}
+    recent_inserts = c.execute('''
+        SELECT DISTINCT tables
+        FROM system.query_log
+        WHERE type = 'QueryStart' AND query_kind = 'Insert'
+          AND event_time > subtractMinutes(now(), %s)
+        ''' % INSERT_MAX_AGE_MINUTES)
+    for (dbnames,) in recent_inserts:
+        for dbname in dbnames:
+            ret[dbname] = dbname
+
+    return ret
+
+###############################################################################
+
+def __main__():
+    if len(sys.argv) != 2:
+        print('''usage: active-tables HOST
+prints out data flows of recent insert queries
+based on Buffer engine and Materialized View dependencies''')
+        sys.exit(2)
+
+    c = Client(host=sys.argv[1], port=9000, user='default', password='')
+
+    mat_views = get_all_materialized_views(c)
+    buffers = get_all_buffer_tables(c)
+    recent_inserts = get_recent_insert_tables(c)
+
+    active_buffers = {}
+    for fr, to in buffers.items():
+        if fr in recent_inserts:
+            print('Buffer: %s -> %s' % (fr, to))
+            active_buffers[fr] = to
+
+    for (fr, to) in mat_views.values():
+        if fr in recent_inserts or fr in active_buffers.values():
+            print('MaterializedView: %s -> %s' % (fr, to))
+
+__main__()
