@@ -363,6 +363,9 @@ class MV(Table):
 
         self.as_select = untokenize(s, as_select)
 
+        # heuristic: remove implicit ASC from sorting key
+        self.as_select = self.as_select.replace(' ASC', '')
+
         # heuristic: remove explicit 'default.' in from-table
         self.as_select = re.sub(r'FROM [a-zA-Z0-9_]*\.', 'FROM ', self.as_select)
 
