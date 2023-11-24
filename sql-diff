@@ -55,14 +55,18 @@ def untokenize(s, t):
     # some extra postprocessing for clean comparison
     return u.replace('( ', '(').replace(' )', ')').strip()
 
-def expand_scientific(s):
+def format_numeric_constant(s):
     '''
-    '5e+3' -> '5000.'
+    '5e+3' -> '5000'
+    '500_000' -> '500000'
+    '500.' -> '500'
     '''
     if s.find('e+') > 0:
-        return '%.0f.' % float(s)
-    else:
-        return s
+        s = '%.0f.' % float(s)
+    if s.endswith('.'):
+        s = s[:-1]
+    s = s.replace('_', '')
+    return s
 
 def preview_diff(a, b):
     def clip(s):
@@ -195,7 +199,8 @@ class MT(Table):
                 elif state == 3:
                     if x.exact_type not in [
                         token.EQUAL, token.COMMA, token.ENDMARKER, token.NEWLINE]:
-                        self.settings[setting] = '%s=%s' % (setting, expand_scientific(x.string))
+                        self.settings[setting] = '%s=%s' % \
+                            (setting, format_numeric_constant(x.string))
                         setting = ''
 
         self.ttl = untokenize(s, ttl)
@@ -430,7 +435,7 @@ class Buffer(Table):
                     name = eval(x.string)
             elif x.type == token.NUMBER:
                 if state == 3:
-                    self.parameters[index] = expand_scientific(x.string)
+                    self.parameters[index] = format_numeric_constant(x.string)
                     index += 1
 
         #print('+', '%s.%s' % (db, name), '"%s"' % s)
