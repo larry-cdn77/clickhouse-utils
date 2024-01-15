@@ -714,8 +714,12 @@ class Dictionary(Table):
                 chtable = eval(x.string)
         if len(chdb) > 0 and len(chtable) > 0:
             return "CLICKHOUSE(DB '%s' TABLE '%s')" % (chdb, chtable)
-        else: # incomplete ClickHouse source or other source
-            return untokenize(s, t) # use whole text including SOURCE
+        else:
+            # incomplete ClickHouse source or other source
+            # use whole text including SOURCE
+            # pad certain keywords so they match ClickHouse's formatting
+            keywords = '|'.join(['CLICKHOUSE', 'SOURCE', 'HTTP'])
+            return re.sub(r'(%s)\(' % keywords, r'\1 (', untokenize(s, t))
 
     def _parse_create_query(self, s, t):
         state = 0 # 1 = PRIMARY, 2 = KEY, 3 = SOURCE, 4 = LAYOUT, 5 = LIFETIME
