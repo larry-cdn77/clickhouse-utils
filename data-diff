@@ -35,7 +35,8 @@ def diff(origin, query, clusters, tolerance):
     absolute = {}
     for shortname, cluster in clusters.items():
         whole_query = \
-            ('WITH toStartOfHour(toDateTime(%d)) AS origin ' % origin) + query
+            'WITH toStartOfHour(toDateTime(%d)) AS origin ' % origin + \
+            'SELECT * FROM (' + query + ')'
         print(whole_query, file=sys.stderr)
         start = datetime.datetime.now()
         try:
