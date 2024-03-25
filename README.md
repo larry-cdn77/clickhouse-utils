@@ -38,6 +38,9 @@ Example:
 data-diff ./clusters ./tables
 ```
 
+Further work: replace with
+[Datafold data-diff](https://github.com/datafold/data-diff)
+
 ## SQL Diff
 
 Usage:
