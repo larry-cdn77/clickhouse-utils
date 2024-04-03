@@ -718,8 +718,11 @@ class Dictionary(Table):
             # incomplete ClickHouse source or other source
             # use whole text including SOURCE
             # pad certain keywords so they match ClickHouse's formatting
-            keywords = '|'.join(['CLICKHOUSE', 'SOURCE', 'HTTP'])
-            return re.sub(r'(%s)\(' % keywords, r'\1 (', untokenize(s, t))
+            # then obfuscate any bearer tokens used
+            keywords = '|'.join(['CLICKHOUSE', 'SOURCE', 'HTTP', 'HEADERS', 'HEADER'])
+            padded = re.sub(r'(%s)\(' % keywords, r'\1 (', untokenize(s, t))
+            obfuscated = re.sub(r'Bearer [^\']*', 'Bearer TOKEN', padded)
+            return obfuscated
 
     def _parse_create_query(self, s, t):
         state = 0 # 1 = PRIMARY, 2 = KEY, 3 = SOURCE, 4 = LAYOUT, 5 = LIFETIME
