@@ -1,5 +1,7 @@
 # Assorted ClickHouse Administrator's Utilities
 
+Actually *not* inspired by [pg-diff](https://michaelsogos.github.io/pg-diff)
+
 ### Common Prerequisites
 
 ClickHouse Driver library, eg:
