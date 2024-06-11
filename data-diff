@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 import datetime
+import itertools
 import os
 import statistics
 import sys
@@ -7,66 +8,87 @@ import time
 
 import clickhouse_driver
 
-__version__ = '0.3'
+__version__ = '1.0'
 
-def resolve(absolute, tolerance):
-    keys, values = list(absolute.keys()), list(absolute.values())
-    zeroes = values.count(0)
-    mean = statistics.mean(values)
-
-    if zeroes == len(absolute):
-        return [0, '0 *']
-    elif zeroes > 0:
-        return [1, '0 ' + ','.join([shortname \
-            for shortname, returned in absolute.items() if returned == 0])]
-    else:
-        summary = []
-        for shortname, returned in absolute.items():
-            if returned < mean * (1 - tolerance / 100.0): # ...and individual dev.
-                summary += [shortname + '<M']
-            elif returned > mean * (1 + tolerance / 100.0):
-                summary += [shortname + '>M']
-        if len(summary) == 0:
-            return [0, '='.join(keys)]
-        else:
-            return [1, ','.join(summary)]
-
-def diff(origin, query, clusters, tolerance):
-    absolute = {}
-    for shortname, cluster in clusters.items():
+def execute(clusters, query, origin):
+    collection = {}
+    for alias, cluster in clusters.items():
         whole_query = \
             'WITH toStartOfHour(toDateTime(%d)) AS origin ' % origin + \
             'SELECT * FROM (' + query + ')'
         print(whole_query, file=sys.stderr)
         start = datetime.datetime.now()
         try:
-            for (returned,) in cluster.execute(whole_query): # first row
-                break
+            rows = {}
+            for line in cluster.execute(whole_query):
+                if len(line) > 1:
+                    rows[line[1:]] = line[0]
+                else:
+                    rows[None] = line[0]
         except clickhouse_driver.errors.ServerException as e:
                 if e.code in [
                     clickhouse_driver.errors.ErrorCodes.UNKNOWN_DATABASE,
                     clickhouse_driver.errors.ErrorCodes.UNKNOWN_TABLE]:
-                    returned = 0
+                    rows = {None: 0}
                 else:
                     raise e
         print('took %d sec' % \
             (datetime.datetime.now() - start).total_seconds(), \
             file=sys.stderr)
-        absolute[shortname] = returned
-    return resolve(absolute, tolerance), absolute
+        collection[alias] = rows
+    return collection
+
+def resolve(collection, tolerance):
+    # first handle clusters whose all returned values in first column are zero
+    zeroes = {alias: list(rows.values()).count(0) == len(rows) \
+        for alias, rows in collection.items()}
+    zeroes_count = list(zeroes.values()).count(True)
+    if zeroes_count == len(collection):
+        return ['GOOD', '0 *', collection]
+    elif zeroes_count > 0:
+        return ['BAD', '0 ' + ','.join([alias \
+            for alias, zeroes in zeroes.items() if zeroes]), collection]
+
+    # now gather unique keys in columns two and above (if present)
+    # https://mathieularose.com/how-not-to-flatten-a-list-of-lists-in-python
+    keys = set(itertools.chain.from_iterable(rows.keys() \
+        for rows in collection.values()))
+
+    # finally establish maximum absolute difference across all returned values
+    result = {alias: 0 for alias in collection.keys()}
+    for key in keys:
+        mean = statistics.mean([rows[key] \
+            for alias, rows in collection.items()])
+        for alias, rows in collection.items():
+            delta = abs(1 - rows[key] / float(mean))
+            result[alias] = max([result[alias], delta])
+
+    # summarise result
+    summary = []
+    for alias in result.keys():
+        if result[alias] > tolerance / 100.0:
+            summary += ['|%s|>M' % alias]
+    if len(summary) == 0:
+        return ['GOOD', '='.join(list(collection.keys())), collection]
+    else:
+        return ['BAD', ','.join(summary), collection]
 
 def __main__():
     if len(sys.argv) not in [3, 4]:
         print('''usage: data-diff CLUSTERS QUERY [TOLERANCE]
 
-- CLUSTERS file line format: SHORT-NAME BOOTSTRAP-HOSTNAME (will add port 9000)
-- TOLERANCE specifies max allowed percentage deviation from mean of all clusters
-- QUERY returns a number and can use `origin' time fixed between clusters
-- output format: GOOD|BAD<TAB>SUMMARY<TAB>VALUES
+- CLUSTERS file line format: ALIAS HOSTNAME (will add port 9000)
+- ALIAS is short name to display in summary
+- HOSTNAME to execute query on
+- QUERY returns rows with value in first column (`origin' alias available)
+- comparison across common keys (second column onwards) a la INNER JOIN
+- TOLERANCE specifies max allowed percentage difference from mean of all clusters
+- result is maximum absolute difference across all rows
+- output format: GOOD|BAD<TAB>SUMMARY<TAB>DETAIL
 ''')
         sys.exit(2)
     clusters = {}
-    tolerance = float(sys.argv[3]) if len(sys.argv) == 4 else 0.1
+    tolerance = float(sys.argv[3]) if len(sys.argv) == 4 else 0.5
     origin = time.time()
     with open(sys.argv[1]) as f:
         for line in f:
@@ -75,9 +97,10 @@ def __main__():
                 raise Exception('bad line: ' + line)
             clusters[split[0]] = clickhouse_driver.Client(
                 host=split[1], port=9000, user='default', password='')
-
     query = sys.argv[2]
-    (stat, summary), absolute = diff(origin, query, clusters, tolerance)
-    print('%s\t%s\t%s' % ('GOOD' if stat == 0 else 'BAD', summary, absolute))
+
+    collection = execute(clusters, query, origin)
+    goodbad, summary, detail = resolve(collection, tolerance)
+    print('%s\t%s\t%s' % (goodbad, summary, detail))
 
 __main__()

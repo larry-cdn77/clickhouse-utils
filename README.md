@@ -29,15 +29,19 @@ Usage:
 data-diff CLUSTERS QUERY [TOLERANCE]
 ```
 
-* CLUSTERS file line format: SHORT-NAME BOOTSTRAP-HOSTNAME (will add port 9000)
-* TOLERANCE specifies max allowed percentage deviation from mean of all clusters
-* QUERY returns a number and can use `origin' time fixed between clusters
-* output format: GOOD|BAD\<TAB\>SUMMARY\<TAB\>VALUES
+* CLUSTERS file line format: ALIAS HOSTNAME (will add port 9000)
+* ALIAS is short name to display in summary
+* HOSTNAME to execute query on
+* QUERY returns rows with value in first column (`origin' alias available)
+* comparison across common keys (second column onwards) a la INNER JOIN
+* TOLERANCE specifies max allowed percentage difference from mean of all clusters
+* result is maximum absolute difference across all rows
+* output format: GOOD|BAD<TAB>SUMMARY<TAB>DETAIL
 
 Example:
 
 ```shell
-data-diff ./clusters ./tables
+data-diff ./clusters "SELECT sum(temperature), time FROM temperatures"
 ```
 
 Further work: replace with
