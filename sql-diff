@@ -940,17 +940,24 @@ class Model(object):
 ###############################################################################
 def __main__():
     if len(sys.argv) < 3:
-        print('''usage: sql-diff HOST FILE ...
+        print('''usage: sql-diff [-u USER -p PASSWORD] HOST FILE ...
 one or more FILEs contain CREATE statements to diff against
 port number in HOST is excluded (9000 will be used)''')
         sys.exit(2)
 
-    live = Model().scan(Client(
-        host=sys.argv[1],
-        port=9000,
-        user='default', password=''))
+    if len(sys.argv) >= 7 and sys.argv[1] == '-u' and sys.argv[3] == '-p':
+        credentials = (sys.argv[2], sys.argv[4])
+        host = sys.argv[5]
+        files = sys.argv[6:]
+    else:
+        credentials = ('default', '')
+        host = sys.argv[1]
+        files = sys.argv[2:]
 
-    repo = Model().read(sys.argv[2:])
+    live = Model().scan(Client(host=host, port=9000,
+        user=credentials[0], password=credentials[1]))
+
+    repo = Model().read(files)
 
     for tl in live.all_tables().values():
         print('%-48s' % tl.dbname, end='')
