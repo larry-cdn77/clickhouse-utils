@@ -408,6 +408,105 @@ class MV(Table):
              self.fr)
 
 ###############################################################################
+class View(Table):
+    '''
+    View engine
+
+    check select statement and source table
+    '''
+    def __init__(self, dbname):
+        super().__init__('MaterializedView', dbname)
+
+        self.as_select = ''
+        self.fr = ''
+
+    def _parse_create_query(self, s, t):
+        state = 0 # 1 = FROM, 2 = full stop
+        fr = []
+        for x in t:
+            if state == 0:
+                if x.type == token.NAME:
+                    if x.string == 'FROM':
+                        state = 1
+                        fr = [] # reset to capture last of multiple 'FROM'
+            elif state == 1:
+                if x.type == token.NAME:
+                    if len(fr) == 0:
+                        fr = [x.string]
+                    else:
+                        state = 0
+                elif x.exact_type == token.DOT:
+                    state = 2
+            elif state == 2:
+                if x.type == token.NAME:
+                    if len(fr) == 1:
+                        fr += [x.string]
+                state = 0
+
+        if len(fr) == 1:
+            self.fr = 'default.%s' % fr[0]
+        else:
+            self.fr = '%s.%s' % (fr[0], fr[1])
+        #print('+', self.fr, '"%s"' % s)
+
+        state = 0 # 1 = seen first AS, 2 = seen SELECT after AS
+        as_select = []
+        for x in t:
+            if state == 0:
+                if x.type == token.NAME and x.string == 'AS':
+                    state = 1
+            elif state == 1:
+                if x.type == token.NAME and x.string == 'SELECT':
+                    state = 2
+                    as_select += [x]
+                else:
+                    state = 0
+            elif state == 2:
+                as_select += [x]
+
+        self.as_select = untokenize(s, as_select)
+
+        # heuristic: remove implicit ASC from sorting key
+        self.as_select = self.as_select.replace(' ASC', '')
+
+        # heuristic: remove explicit 'default.' in from-table
+        self.as_select = re.sub(r'FROM [a-zA-Z0-9_]*\.', 'FROM ', self.as_select)
+
+    def scan(self, client):
+        self._parse_create_query(*client.execute_clickhouse_tables_sql_tokens(
+            self.dbname, 'create_table_query'))
+
+        return self
+
+    def read(self, s, t):
+        self._parse_create_query(s, t)
+        return self
+
+    def diff(self, other):
+        ret = super().diff(other)
+        if len(ret) > 0:
+            return ret
+
+        if self.as_select != other.as_select:
+            s = preview_diff(self.as_select, other.as_select)
+            #s = '["%s", "%s"]' % (self.as_select, other.as_select)
+            if len(s) > 0:
+                s = ' (%s)' % s
+            ret += ['AS SELECT statement%s' % s]
+
+        if self.fr != other.fr:
+            ret += ['FROM table']
+
+        return ret
+
+    def __str__(self):
+        return \
+            '%s AS %s (FROM %s)' % \
+            (str(super()),
+             self.as_select,
+             self.fr)
+
+###############################################################################
 class Buffer(Table):
     '''
     Buffer engine
@@ -801,12 +900,13 @@ class Model(object):
     def __init__(self):
         self.mt = {}
         self.mv = {}
+        self.view = {}
         self.buffer = {}
         self.dist = {}
         self.null = {}
 
     def all_tables(self):
-        return self.mt | self.mv | self.buffer | self.dist | self.null
+        return self.mt | self.mv | self.view | self.buffer | self.dist | self.null
 
     def _scan_table(self, client, dbname):
         for (engine,) in client.execute('''SELECT engine FROM system.tables
@@ -816,6 +916,8 @@ class Model(object):
                 self.mt[dbname] = MT(dbname, engine).scan(client)
             elif engine == 'MaterializedView':
                 self.mv[dbname] = MV(dbname).scan(client)
+            elif engine == 'View':
+                self.view[dbname] = View(dbname).scan(client)
             elif engine == 'Buffer':
                 self.buffer[dbname] = Buffer(dbname).scan(client)
             elif engine == 'Distributed':
@@ -897,6 +999,9 @@ class Model(object):
         elif t[1].string == 'DICTIONARY':
             dbname = self._read_dbname(t[2:])
             engine = 'Dictionary'
+        elif t[1].string == 'VIEW':
+            dbname = self._read_dbname(t[2:])
+            engine = 'View'
         elif t[1].string == 'TABLE':
             dbname = self._read_dbname(t[2:])
             engine = self._read_engine(t)
@@ -907,6 +1012,8 @@ class Model(object):
             self.mt[dbname] = MT(dbname, engine).read(s, t)
         elif engine == 'MaterializedView':
             self.mv[dbname] = MV(dbname).read(s, t)
+        elif engine == 'View':
+            self.view[dbname] = View(dbname).read(s, t)
         elif engine == 'Buffer':
             self.buffer[dbname] = Buffer(dbname).read(s, t)
         elif engine == 'Distributed':
