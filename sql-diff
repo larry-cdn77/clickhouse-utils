@@ -1066,8 +1066,10 @@ port number in HOST is excluded (9000 will be used)''')
 
     repo = Model().read(files)
 
+    longest_name = len(max(live.all_tables().keys(), key=len)) + 2
+
     for tl in live.all_tables().values():
-        print('%-48s' % tl.dbname, end='')
+        print(('%%-%ds' % longest_name) % tl.dbname, end='')
 
         try:
             tf = repo.all_tables()[tl.dbname]
