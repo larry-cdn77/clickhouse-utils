@@ -1,4 +1,4 @@
-# Assorted ClickHouse Administrator's Utilities
+# ClickHouse Administrator's Assorted Utilities
 
 Actually *not* inspired by [pg-diff](https://michaelsogos.github.io/pg-diff)
 
