@@ -812,9 +812,11 @@ class Dictionary(Table):
                 if state == 3 or state == 4:
                     state = 5
             if state == 3:
-                chdb = eval(x.string)
+                if chdb == '':
+                    chdb = eval(x.string)
             elif state == 4:
-                chtable = eval(x.string)
+                if chtable == '':
+                    chtable = eval(x.string)
         if len(chdb) > 0 and len(chtable) > 0:
             return "CLICKHOUSE(DB '%s' TABLE '%s')" % (chdb, chtable)
         else:
