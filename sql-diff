@@ -369,6 +369,10 @@ class MV(Table):
         # heuristic: remove explicit 'default.' in from-table
         self.as_select = re.sub(r'FROM [a-zA-Z0-9_]*\.', 'FROM ', self.as_select)
 
+        # heuristic: remove explicit 'default.' in dictHas and dictGet calls
+        self.as_select = re.sub(r"dict(Get|Has)\('default\.([^']*)'",
+            r"dict\1('\2'", self.as_select)
+
     def scan(self, client):
         self._parse_create_query(*client.execute_clickhouse_tables_sql_tokens(
             self.dbname, 'create_table_query'))
