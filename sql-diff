@@ -930,6 +930,10 @@ class Model(object):
                 self.null[dbname] = KeeperMap(dbname).scan(client)
             elif engine == 'Dictionary':
                 self.null[dbname] = Dictionary(dbname).scan(client)
+            elif engine == 'PostgreSQL':
+                # silently ignore PostgreSQL engine
+                # (virtual tables dynamically populated in PostgreSQL database)
+                pass
             else:
                 print('warning: %s: ignore unrecognised engine: %s' % (dbname, engine))
 
