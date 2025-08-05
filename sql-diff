@@ -278,7 +278,7 @@ class MT(Table):
     def __str__(self):
         return \
             '%s TTL %s SETTINGS %s PARTITION BY %s ORDER BY %s' % \
-            (str(super()),
+            (super().__str__(),
              self.ttl,
              ','.join(self.settings.values()),
              self.partition_key,
@@ -406,7 +406,7 @@ class MV(Table):
     def __str__(self):
         return \
             '%s TO %s AS %s (FROM %s)' % \
-            (str(super()),
+            (super().__str__(),
              self.to,
              self.as_select,
              self.fr)
@@ -506,7 +506,7 @@ class View(Table):
     def __str__(self):
         return \
             '%s AS %s (FROM %s)' % \
-            (str(super()),
+            (super().__str__(),
              self.as_select,
              self.fr)
 
@@ -573,7 +573,7 @@ class Buffer(Table):
     def __str__(self):
         return \
             '%s TO %s (%s)' % \
-            (str(super()),
+            (super().__str__(),
              self.to,
              ','.join(self.parameters.values()))
 
@@ -631,7 +631,7 @@ class Dist(Table):
     def __str__(self):
         return \
             '%s FROM %s' % \
-            (str(super()),
+            (super().__str__(),
              self.fr)
 
 ###############################################################################
@@ -662,7 +662,7 @@ class Null(Table):
         return ret
 
     def __str__(self):
-        return str(super())
+        return super().__str__()
 
 ###############################################################################
 class TinyLog(Table):
@@ -692,17 +692,17 @@ class TinyLog(Table):
         return ret
 
     def __str__(self):
-        return str(super())
+        return super().__str__()
 
 ###############################################################################
-class KeeperMap(Table):
+class Keeper(Table):
     '''
     KeeperMap engine
 
     check columns and node path
     '''
     def __init__(self, dbname):
-        super().__init__('KeeperMap', dbname)
+        super().__init__('Keeper', dbname)
 
         self.node_path = ''
 
@@ -740,7 +740,7 @@ class KeeperMap(Table):
         return ret
 
     def __str__(self):
-        return str(super())
+        return super().__str__()
 
 ###############################################################################
 class Dictionary(Table):
@@ -896,10 +896,114 @@ class Dictionary(Table):
         return ret
 
     def __str__(self):
+        return super().__str__()
+
+###############################################################################
+class Kafka(Table):
+    '''
+    Kafka engine
+
+    check broker list, topic list, format and settings
+    '''
+    def __init__(self, dbname):
+        super().__init__('Kafka', dbname)
+
+        self.brokers = []
+        self.topics = []
+        self.format = ''
+        self.settings = {}
+
+    def _parse_engine(self, s, t):
+        state = 0 # 1 = Kafka, 2 = (, 3 = first identifier,
+                  # 4 = second identifer, 5 = third identifier,
+                  # 6 = fourth identifier, 7 = ), 8 = SETTINGS
+        setting = ''
+        for x in t:
+            if x.type == token.NAME:
+                if state == 0:
+                    if x.string == 'Kafka':
+                        state = 1
+                elif state == 7:
+                    if x.string == 'SETTINGS':
+                        state = 8
+                elif state == 8:
+                    if setting == '':
+                        setting = x.string
+                    else:
+                        self.settings[setting] = '%s=%s' % (setting, x.string)
+                        setting = ''
+            elif x.type == token.STRING:
+                if state == 2:
+                    self.brokers = x.string.strip('\'').split(',')
+                    state = 3
+                elif state == 3:
+                    self.topics = x.string.strip('\'').split(',')
+                    state = 4
+                elif state == 4:
+                    state = 5
+                elif state == 5:
+                    self.format = x.string.strip('\'')
+                    state = 6
+            else:
+                if state == 1:
+                    if x.exact_type == token.LPAR:
+                        state = 2
+                elif state == 6:
+                    if x.exact_type == token.RPAR:
+                        state = 7
+                elif state == 8:
+                    if x.exact_type not in [
+                        token.EQUAL, token.COMMA, token.ENDMARKER, token.NEWLINE]:
+                        self.settings[setting] = '%s=%s' % \
+                            (setting, format_numeric_constant(x.string))
+                        setting = ''
+
+    def scan(self, client):
+        (s, t) = client.execute_clickhouse_tables_sql_tokens(
+            self.dbname, 'create_table_query')
+
+        self._parse_engine(s, t)
+        return self
+
+    def read(self, s, t):
+        self._parse_engine(s, t)
+        return self
+
+    def diff(self, other):
+        ret = super().diff(other)
+        if len(ret) > 0:
+            return ret
+
+        if len(self.brokers) > 0 and len(other.brokers) > 0:
+            diff = list(difflib.unified_diff(sorted(self.brokers),
+                sorted(other.brokers), n=0, lineterm=''))
+            if len(diff) > 0:
+                return ['brokers: ' + ' '.join(diff)]
+        elif len(self.brokers) > 0 or len(others.brokers) > 0:
+            ret += ['brokers (%d %d)' % (len(self.brokers), len(other.brokers))]
+
+        if len(self.topics) > 0 and len(other.topics) > 0:
+            diff = list(difflib.unified_diff(sorted(self.topics),
+                sorted(other.topics), n=0, lineterm=''))
+            if len(diff) > 0:
+                return ['topics: ' + ' '.join(diff)]
+        elif len(self.topics) > 0 or len(others.topics) > 0:
+            ret += ['topics (%d %d)' % (len(self.topics), len(other.topics))]
+
+        if self.format != other.format:
+            ret += ['format (%s %s)' % (self.format, other.format)]
+
+        for setting in set(self.settings.values()) ^ set(other.settings.values()):
+            ret += [setting]
+
+        return ret
+
+    def __str__(self):
         return \
-            '%s %s' % \
-            (self.engine,
-             self.dbname)
+            '%s %s @ %s' % \
+            (super().__str__(),
+             self.topics,
+             self.brokers)
 
 ###############################################################################
 class Model(object):
@@ -910,9 +1014,15 @@ class Model(object):
         self.buffer = {}
         self.dist = {}
         self.null = {}
+        self.tiny = {}
+        self.keeper = {}
+        self.dictionary = {}
+        self.kafka = {}
 
     def all_tables(self):
-        return self.mt | self.mv | self.view | self.buffer | self.dist | self.null
+        return \
+            self.mt | self.mv | self.view | self.buffer | self.dist | \
+            self.null | self.tiny | self.keeper | self.dictionary | self.kafka
 
     def _scan_table(self, client, dbname):
         for (engine,) in client.execute('''SELECT engine FROM system.tables
@@ -931,11 +1041,13 @@ class Model(object):
             elif engine == 'Null':
                 self.null[dbname] = Null(dbname).scan(client)
             elif engine == 'TinyLog':
-                self.null[dbname] = TinyLog(dbname).scan(client)
+                self.tiny[dbname] = TinyLog(dbname).scan(client)
             elif engine == 'KeeperMap':
-                self.null[dbname] = KeeperMap(dbname).scan(client)
+                self.keeper[dbname] = Keeper(dbname).scan(client)
             elif engine == 'Dictionary':
-                self.null[dbname] = Dictionary(dbname).scan(client)
+                self.dictionary[dbname] = Dictionary(dbname).scan(client)
+            elif engine == 'Kafka':
+                self.kafka[dbname] = Kafka(dbname).scan(client)
             elif engine == 'PostgreSQL':
                 # silently ignore PostgreSQL engine
                 # (virtual tables dynamically populated in PostgreSQL database)
@@ -954,11 +1066,11 @@ class Model(object):
 
     def _verify_dependencies(self):
         for dbname, mv in self.mv.items():
-            if mv.fr not in (self.mt | self.null):
-                print('warning: %s from-table %s not found amongst known MergeTree and Null' % \
+            if mv.fr not in (self.mt | self.null | self.kafka):
+                print('warning: %s from-table %s not found amongst known MergeTree, Null and Kafka' % \
                   (dbname, mv.fr))
-            if mv.to not in (self.mt | self.null):
-                print('warning: %s to-table %s not found amogst known running MergeTree and Null' % \
+            if mv.to not in (self.mt | self.null | self.kafka):
+                print('warning: %s to-table %s not found amogst known running MergeTree, Null and Kafka' % \
                   (dbname, mv.to))
 
     def scan(self, client):
@@ -1031,11 +1143,13 @@ class Model(object):
         elif engine == 'Null':
             self.null[dbname] = Null(dbname).read(s, t)
         elif engine == 'TinyLog':
-            self.null[dbname] = TinyLog(dbname).read(s, t)
+            self.tiny[dbname] = TinyLog(dbname).read(s, t)
         elif engine == 'KeeperMap':
-            self.null[dbname] = KeeperMap(dbname).read(s, t)
+            self.keeper[dbname] = Keeper(dbname).read(s, t)
         elif engine == 'Dictionary':
-            self.null[dbname] = Dictionary(dbname).read(s, t)
+            self.dictionary[dbname] = Dictionary(dbname).read(s, t)
+        elif engine == 'Kafka':
+            self.kafka[dbname] = Kafka(dbname).read(s, t)
 
     def _read_statement(self, s, t):
         if t[0].string == 'CREATE':
