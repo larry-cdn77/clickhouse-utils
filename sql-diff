@@ -346,14 +346,14 @@ class MV(Table):
             self.fr = '%s.%s' % (fr[0], fr[1])
         #print('+', self.fr, self.to, '"%s"' % s)
 
-        state = 0 # 1 = seen first AS, 2 = seen SELECT after AS
+        state = 0 # 1 = seen first AS, 2 = seen SELECT or WITH after AS
         as_select = []
         for x in t:
             if state == 0:
                 if x.type == token.NAME and x.string == 'AS':
                     state = 1
             elif state == 1:
-                if x.type == token.NAME and x.string == 'SELECT':
+                if x.type == token.NAME and x.string in ['SELECT', 'WITH']:
                     state = 2
                     as_select += [x]
                 else:
