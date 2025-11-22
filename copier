@@ -1,0 +1,379 @@
+#!/bin/zsh
+if [[ $1 == --dry-run ]] ; then
+  dry_run=1
+  shift
+elif [[ $1 == --allow-materializedview ]] ; then
+  allow_materializedview=1
+  shift
+fi
+
+if (( $# != 8 )) ; then
+  print "\
+usage: $0 [OPTIONS] ALICE BOB FOO BAR TIMESTAMP AGGREGATE RATIO DAY
+
+ClickHouse idempotent data copy
+
+copy FOO table on ALICE to BAR table on BOB
+
+  - interate over all DAY arguments against TIMESTAMP column
+  - validate by counting AGGREGATE expression, success means abs(a-b)/a < RATIO
+  - username 'copier' with password read from \$HOME/.copier
+
+OPTIONS
+
+  --dry-run                 just compare, without deleting or copying
+  --allow-materializedview  treat detected MVs as a warning rather than error
+
+remarks:
+
+  - objective is robustness not speed, scale by running multiple concurrently
+  - sleep N seconds if \$HOME/.copier-sleep exists containing the number N
+  - delete, validate and insert one hour at a time
+  - print the word OK for each hour completed
+  - print a summary starting with the word successfully at the end
+  - recommend user be read-only on ALICE (in case accidentally swapped)
+  - work with default database but use currentDatabase() in remote SELECT
+  - intentionally host-to-host with sharding considerations left to operator
+  - typically copy MergeTree to MergeTree
+  - dry run makes sense to have Distributed destination
+  - dry run still skips on zero source rows so watch out
+  - current USER name recorded as a query log comment for auditing purposes
+
+example:
+
+  $0 copier bob txns txns ts sumMerge\\\\(val\\\\) 0.01 2025-09-01" 1>&2
+  exit 2
+fi
+
+user=copier
+pswd=`cat $HOME/.copier` || exit $?
+database=default
+hsrc=$1
+hdst=$2
+tsrc=$3
+tdst=$4
+timestamp=$5
+aggregate=$6
+ratio=$7
+day=$8
+
+zmodload zsh/mathfunc # abs function
+
+function oneline() {
+  sed -e 's/\\$//' -e 's/^ */ /' | \
+    tr -d '\n' | \
+    sed -e 's/^ //' -e 's/  *$//' -e 's/^  *//'
+}
+
+function sanitise() {
+  python3 <(cat <<EOF
+import sys
+sys.stdout.write(sys.stdin.read(). \\
+  replace('$pswd', 'HIDDEN'). \\
+  replace('$hsrc', 'alice'))
+EOF
+  )
+}
+
+# client config.xml trumps environment variables in vanilla ClickHouse 
+alias client="clickhouse client \
+  -u $user --password '$pswd' --log_comment=$USER -d $database"
+
+# check access through the dedicated user
+if ! client -h $hsrc -q "SELECT 1 FORMAT Null" ; then
+  print unable to query $hsrc
+  exit 1
+elif ! client -h $hdst -q "SELECT 1 FORMAT Null" ; then
+  print unable to query $hdst
+  exit 1
+fi
+
+# check access to source from destination through remote function
+if ! client -h $hdst -q "
+  SELECT count() FROM (
+    SELECT * FROM remote(
+      '$hsrc', 'system', 'numbers', '$user', '$pswd'
+    ) LIMIT 10
+  )
+" | grep '\<10\>' -q ; then
+  print remote access failed
+  exit 1
+fi
+
+# check tables exist
+if ! client -h $hsrc -q "SHOW CREATE $tsrc FORMAT Null" ; then
+  print abort: did not find $tsrc on $hsrc
+  exit 1
+elif ! client -h $hdst -q "SHOW CREATE $tdst FORMAT Null" ; then
+  print abort: did not find $tdst on $hdst
+  exit 1
+fi
+
+# run a basic schema comparison - just column names
+acols=($(client -h $hsrc -q "DESCRIBE $tsrc" | cut -f1)) ; result=$?
+if [[ $result != 0 ]] ; then
+  print abort: unable to run schema check on $hsrc
+  exit 1
+fi
+bcols=($(client -h $hdst -q "DESCRIBE $tdst" | cut -f1)) ; result=$?
+if [[ $result != 0 ]] ; then
+  print abort: unable to run schema check on $hdst
+  exit 1
+fi
+if [[ ${acols[@]} != ${bcols[@]} ]] ; then
+  print error: mismatching column names
+  print alice: ${acols[@]}
+  print bob: ${bcols[@]}
+  exit 1
+fi
+
+# compare table engines as well
+if [[ -z $dry_run ]] ; then
+  aengine=$(client -h $hsrc -q "
+    SELECT engine FROM system.tables
+    WHERE database = currentDatabase() AND name = '$tsrc'
+  ") ; result=$?
+  if [[ $result != 0 ]] ; then
+    print abort: engine check failed on $hsrc
+    exit 1
+  fi
+  bengine=$(client -h $hdst -q "
+    SELECT engine FROM system.tables
+    WHERE database = currentDatabase() AND name = '$tdst'
+  ") ; result=$?
+  if [[ $result != 0 ]] ; then
+    print abort: engine check failed on $hdst
+    exit 1
+  fi
+  if [[ $aengine != $bengine ]] ; then
+    # omit check if resharding where you might do Distributed -> MergeTree
+    print abort: engine mismatch $aengine vs $bengine
+    exit 1
+  fi
+fi
+
+# check timestamp and aggregate columns exist
+if ! client -h $hsrc -q "SHOW CREATE $tsrc FORMAT Null" ; then
+  print abort: did not find $tsrc on $hsrc
+  exit 1
+elif ! client -h $hdst -q "SHOW CREATE $tdst FORMAT Null" ; then
+  print abort: did not find $tdst on $hdst
+  exit 1
+elif ! client -h $hsrc -q "
+  SELECT $aggregate FROM $tsrc WHERE $timestamp = now() FORMAT Values
+" | grep '([0-9][0-9]*)' -q ; then
+  print abort: aggregate query spot check failed at $hsrc
+  exit 1
+elif ! client -h $hdst -q "
+  SELECT $aggregate FROM $tdst WHERE $timestamp = now() FORMAT Values
+" | grep '([0-9][0-9]*)' -q ; then
+  print abort: aggregate query spot check failed at $hdst
+  exit 1
+fi
+
+# check permissions are sane and safe
+# this seems to make sense without the supplied credentials
+# but the node itself will not have a default admin access set up
+if [[ -z $dry_run ]] ; then
+  if client -h $hsrc -q "
+    SELECT access_type FROM system.grants WHERE user_name = '$user'
+    UNION ALL
+    SELECT access_type FROM system.grants
+    INNER JOIN (
+      SELECT granted_role_name FROM system.role_grants WHERE user_name = '$user'
+    ) AS b
+    ON role_name = granted_role_name
+  " | grep -e ALL -e INSERT -e DELETE -q ; then
+    print abort: found writeable permissions at $hsrc
+    exit 1
+  fi # avoid elif here and run both checks
+  if ! client -h $hdst -q "
+    SELECT access_type FROM system.grants WHERE user_name = '$user'
+    UNION ALL
+    SELECT access_type FROM system.grants
+    INNER JOIN (
+      SELECT granted_role_name FROM system.role_grants WHERE user_name = '$user'
+    ) AS b
+    ON role_name = granted_role_name
+  " | grep INSERT -q ; then
+    print abort: did not find writeable permissions at $hdst
+    exit 1
+  fi
+fi
+
+# check unintended materialised views
+if [[ -z $dry_run ]] ; then
+  output=$(client -h $hdst -q "
+    SELECT name FROM system.tables
+    WHERE match(create_table_query, 'FROM \\w+.$tdst')
+  ") ; result=$?
+  if [[ $result != 0 ]] ; then
+    print abort: unable to run MV check
+    exit 1
+  elif [[ -n $output ]] ; then
+    if [[ -n $allow_materializedview ]] ; then
+      print warning: some tables seem to have $tdst as an MV dependency
+      print $output | xargs
+    else
+      print abort: some tables seem to have $tdst as an MV dependency
+      print $output | xargs
+      exit 1
+    fi
+  fi
+fi
+
+oks=0
+
+print $day
+
+for hh in {00..23} ; do
+  print + hour $hh
+  timespec="toStartOfHour($timestamp) = '$day $hh:00:00'"
+
+  retry=5 # retries help with misbehaving sync delete
+  while (( $retry > 0 )) ; do # allow retry of whole hour
+    (( retry < 5 )) && print retry number $(( 5 - retry ))
+    let retry--
+
+    # get source row count and skip if zero (not this breaks dry run)
+    arows=$(client -h $hsrc -q "
+      SELECT count() FROM $tsrc WHERE $timespec
+    ")
+    result=$?
+    if [[ $result != 0 ]] ; then
+      print error: row count query failed at $hsrc
+      continue
+    fi
+    if [[ $arows = 0 ]] ; then
+      print OK: zero row count
+      let oks++
+      retry=0
+      continue
+    else
+      print alice non-zero row count
+    fi
+
+    # get source aggregate
+    aagg=$(client -h $hsrc -q "
+      SELECT $aggregate FROM $tsrc WHERE $timespec
+    ")
+    result=$?
+    if [[ $result != 0 ]] ; then
+      print error: aggregate query failed at $hsrc
+      continue
+    fi
+    print alice has $aagg
+
+    # get destination aggregate and skip if possible
+    bagg=$(client -h $hdst -q "
+      SELECT $aggregate FROM $tdst WHERE $timespec
+    ")
+    result=$?
+    if [[ $result != 0 ]] ; then
+      print error: aggregate query failed at $hdst
+      continue
+    fi
+    print bob has $bagg
+    if (( aagg == 0 )) ; then
+      if (( bagg == 0 )) ; then
+        print OK: zero aggregate
+        let oks++
+        retry=0
+        continue
+      fi
+    elif (( 1.0 * abs(bagg - aagg) / aagg < ratio )) ; then
+      print OK: equality
+      let oks++
+      retry=0
+      continue
+    fi
+
+    if [[ -z $dry_run ]] ; then
+      # get destination row count
+      brows=$(client -h $hdst -q "
+        SELECT count() FROM $tdst WHERE $timespec
+      ")
+      result=$?
+      if [[ $result != 0 ]] ; then
+        print error: row count query failed at $hdst
+        continue
+      fi
+
+      if (( brows == 0 )) ; then
+        print zero row count at $hdst so skip erase
+      else
+        print needs erasing \($brows rows\)
+
+        # erase whole hour, if needed - issue a synchronous alter-delete
+        settings="SETTINGS mutations_sync = 2"
+        if ! print -n "ALTER TABLE $tdst DELETE WHERE $timespec $settings" | \
+          client -h $hdst --echo ; then
+          print error: delete query failed
+          continue
+        fi
+
+        sleep 1 # rows seen after sync delete so give it some space to actually happen
+
+        # check actually erased - row count
+        if ! client -h $hdst -q "
+          SELECT count() || ' rows after delete' FROM $tdst WHERE $timespec
+        " | grep '\<0 rows' ; then
+          print error: non-zero row count after delete using $timespec \
+            \(or query failed\)
+          continue
+        fi
+      fi
+
+      # rate control
+      [[ -e .copier-sleep ]] && print sleep && sleep `cat .copier-sleep`
+
+      # while smaller units like 15 minutes would seem useful
+      # I have had problems with tables returning 0 after INSERT-SELECT
+      # works fine doing 1 hour at a time and I was unable to explain why
+
+      # the meat and potatoes - actual inserting happens here
+      if ! print "
+        INSERT INTO $tdst
+        SELECT * FROM remote(
+          '$hsrc', currentDatabase(), '$tsrc', '$user', '$pswd'
+        )
+        WHERE toStartOfHour($timestamp) = '$day $hh:00:00'
+      " | oneline | client -h $hdst --echo | sanitise ; then
+        print insert error
+        continue
+      fi
+
+      # wrong row count seen after instert so give things a bit of time
+      sleep 1
+    fi
+
+    # get destination aggregate and check
+    bagg=$(client -h $hdst -q "
+      SELECT $aggregate FROM $tdst WHERE $timespec
+    ")
+    result=$?
+    if [[ $result != 0 ]] ; then
+      print error: aggregate query failed at $hdst
+      continue
+    fi
+    print bob has $bagg
+    if (( aagg == 0 )) ; then
+      if (( bagg != 0 )) ; then
+        print mismatch
+        [[ -n $dry_run ]] && retry=0
+        continue
+      fi
+    elif (( 1.0 * abs(bagg - aagg) / aagg >= ratio )) ; then
+      print mismatch
+      [[ -n $dry_run ]] && retry=0
+      continue
+    fi
+
+    print OK: equality
+    let oks++
+    retry=0
+  done
+done
+shift
+
+print successfully completed $oks/24 hours of $day for $tdst
