@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+import argparse
+import requests
+from requests.exceptions import HTTPError
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Compare ClickHouse Distributed tables with their local tables "
+                    "and report schema mismatches."
+    )
+    parser.add_argument(
+        "--host",
+        default="http://localhost:8123",
+        help="ClickHouse HTTP endpoint (default: http://localhost:8123)",
+    )
+    parser.add_argument(
+        "--user",
+        default="default",
+        help="ClickHouse user (default: default)",
+    )
+    parser.add_argument(
+        "--password",
+        default="",
+        help="ClickHouse password (default: empty)",
+    )
+    parser.add_argument(
+        "--database",
+        default="default",
+        help="Database to inspect (default: default)",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print verbose debug information while comparing schemas.",
+    )
+    return parser.parse_args()
+
+class ClickhouseClient:
+    def __init__(self,host,user,password,database):
+        self.host=host
+        self.user=user
+        self.password=password
+        self.database=database
+    def query(self,sql):
+        params = {
+            "user": self.user,
+            "password": self.password,
+            "database": self.database,
+            "default_format": "JSON",
+        }
+
+        resp = requests.post(f"{self.host}:8123/", params=params, data=sql)
+        if( "exception" in resp.json()):
+            print("Clickhouse exception: " + resp.json()["exception"])
+        
+        resp.raise_for_status()
+        return resp.json()["data"]
+
+
+    def get_distributed_tables(self):
+        sql = f"""
+        SELECT name, engine_full
+        FROM system.tables
+        WHERE engine = 'Distributed' AND database = '{self.database}'
+        """
+        return [(row["name"],row["engine_full"]) for row in self.query(sql)]
+
+    def describe_table(self,table):
+        sql = f"""
+        DESCRIBE {self.database}.{table}
+        """
+        return [(row["name"],row["type"]) for row in self.query(sql)]
+
+def parse_engine(full_engine: str):
+    spl = full_engine.split(",")
+    table = spl[2]
+    table = table.strip(" ")
+    table = table.strip("'")
+    return table
+
+def compare_schemas_strict(dist_cols, local_cols):
+    """
+    Compare schemas strictly:
+      - same number of columns
+      - same column name and type at each position (0-based index)
+
+    dist_cols, local_cols: list[(name, type)]
+
+    Returns:
+      list of human-readable mismatch descriptions.
+      Empty list => schemas are identical.
+    """
+    diffs = []
+
+    len_dist = len(dist_cols)
+    len_local = len(local_cols)
+
+    min_len = min(len_dist, len_local)
+
+    # Compare common prefix by position
+    for idx in range(min_len):
+        name_d, type_d = dist_cols[idx]
+        name_l, type_l = local_cols[idx]
+
+        if name_d != name_l or type_d != type_l:
+            diffs.append(
+                f"At position {idx}: "
+                f"Distributed = '{name_d}' {type_d}, "
+                f"Local = '{name_l}' {type_l}"
+            )
+
+    # Extra columns in Distributed
+    if len_dist > len_local:
+        diffs.append(
+            f"Column count mismatch: Distributed has {len_dist} columns, "
+            f"local has {len_local} columns."
+        )
+        for idx in range(min_len, len_dist):
+            name_d, type_d = dist_cols[idx]
+            diffs.append(
+                f"At position {idx}: Local is missing column "
+                f"'{name_d}' {type_d} present in Distributed."
+            )
+
+    # Extra columns in Local
+    if len_local > len_dist:
+        diffs.append(
+            f"Column count mismatch: Distributed has {len_dist} columns, "
+            f"local has {len_local} columns."
+        )
+        for idx in range(min_len, len_local):
+            name_l, type_l = local_cols[idx]
+            diffs.append(
+                f"At position {idx}: Distributed is missing column "
+                f"'{name_l}' {type_l} present in local."
+            )
+
+    return diffs
+
+
+def main():
+    args = parse_args()
+    ch = ClickhouseClient(args.host,args.user,args.password,args.database)
+    ch.query("select count() from system.tables")
+    print(f"Connected to clickhouse at {args.host}")
+
+
+
+    distributed_tables =  ch.get_distributed_tables()
+
+
+    for (distributed,distributed_engine) in distributed_tables:
+        local = parse_engine(distributed_engine)
+        if(args.verbose):
+            print(f"{distributed} -> {local}")
+
+        dist_schema = ch.describe_table(distributed)
+        local_schema = ch.describe_table(local)
+
+        diffs = compare_schemas_strict(dist_schema, local_schema)
+        if  diffs:
+            if not args.verbose:
+                print(f"{distributed} -> {local}")
+            for d in diffs:
+                print( "    - " + d)
+
+
+main()
+
