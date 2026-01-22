@@ -327,13 +327,10 @@ for hh in {00..23} ; do
       # rate control
       [[ -e .copier-sleep ]] && print sleep && sleep `cat .copier-sleep`
 
-      # while smaller units like 15 minutes would seem useful
-      # I have had problems with tables returning 0 after INSERT-SELECT
-      # works fine doing 1 hour at a time and I was unable to explain why
-
       # the meat and potatoes - actual inserting happens here
       if ! print "
         INSERT INTO $tdst
+        SETTINGS insert_deduplicate = 0
         SELECT * FROM remote(
           '$hsrc', currentDatabase(), '$tsrc', '$user', '$pswd'
         )
