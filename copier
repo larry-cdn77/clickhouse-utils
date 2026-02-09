@@ -32,7 +32,7 @@ remarks:
   - print the word OK for each hour completed
   - print a summary starting with the word successfully at the end
   - recommend user be read-only on ALICE (in case accidentally swapped)
-  - work with default database but use currentDatabase() in remote SELECT
+  - work with default database (change in code, if needed)
   - intentionally host-to-host with sharding considerations left to operator
   - typically copy MergeTree to MergeTree
   - dry run makes sense to have Distributed destination
@@ -131,7 +131,7 @@ fi
 if [[ -z $dry_run ]] ; then
   aengine=$(client -h $hsrc -q "
     SELECT engine FROM system.tables
-    WHERE database = currentDatabase() AND name = '$tsrc'
+    WHERE database = '$database' AND name = '$tsrc'
   ") ; result=$?
   if [[ $result != 0 ]] ; then
     print abort: engine check failed on $hsrc
@@ -139,7 +139,7 @@ if [[ -z $dry_run ]] ; then
   fi
   bengine=$(client -h $hdst -q "
     SELECT engine FROM system.tables
-    WHERE database = currentDatabase() AND name = '$tdst'
+    WHERE database = '$database' AND name = '$tdst'
   ") ; result=$?
   if [[ $result != 0 ]] ; then
     print abort: engine check failed on $hdst
@@ -173,7 +173,7 @@ fi
 
 # check permissions are sane and safe
 # this seems to make sense without the supplied credentials
-# but the node itself will not have a default admin access set up
+# but the node itself will not have out-of-the-box admin access set up
 if [[ -z $dry_run ]] ; then
   if client -h $hsrc -q "
     SELECT access_type FROM system.grants WHERE user_name = '$user'
@@ -332,7 +332,7 @@ for hh in {00..23} ; do
         INSERT INTO $tdst
         SETTINGS insert_deduplicate = 0
         SELECT * FROM remote(
-          '$hsrc', currentDatabase(), '$tsrc', '$user', '$pswd'
+          '$hsrc', '$database', '$tsrc', '$user', '$pswd'
         )
         WHERE toStartOfHour($timestamp) = '$day $hh:00:00'
       " | oneline | client -h $hdst --echo | sanitise ; then
