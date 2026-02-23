@@ -9,7 +9,7 @@ import tokenize
 
 import clickhouse_driver
 
-__version__ = '0.1.4'
+__version__ = '0.2'
 
 sqlparse_format = {
     'strip_comments': True,
@@ -68,6 +68,35 @@ def format_numeric_constant(s):
     s = s.replace('_', '')
     return s
 
+def bool_as_integer(val):
+    if val == 'true':
+        return 1
+    elif val == 'false':
+        return 0
+    else:
+        return val
+
+def extract_name_plain_or_backticks(s, t):
+    state = 0 # 4 = NAME (plain),
+              # 1 = first ERRORTOKEN,
+              # 2 = second ERRORTOKEN (opening backtick),
+              # 3 = third ERRORTOKEN (closing backtick),
+    name = ''
+    for x in t:
+        if x.type == token.NAME:
+            if state == 0:
+                name = x.string
+                state = 4
+        if x.exact_type == token.ERRORTOKEN:
+            if state in [0, 1, 2]:
+                state += 1
+        else:
+            if state == 2:
+                name += x.string
+        if state == 3 or state == 4:
+            break
+    return name
+
 def preview_diff(a, b):
     def clip(s):
         if len(s) > 80:
@@ -84,20 +113,22 @@ def preview_diff(a, b):
             return clip('"%s" -> "%s"' % (a[i1:i2], b[j1:j2]))
     return ''
 
+def tokenize_sql(expression):
+    formatted = sqlparse.format(expression, **sqlparse_format)
+    return formatted, \
+        list(tokenize.generate_tokens(io.StringIO(formatted).readline))
+
 ###############################################################################
 class Client(clickhouse_driver.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def execute_clickhouse_tables_sql_tokens(self, dbname, column):
+    def execute_tables(self, dbname, column):
         (value,) = \
             self.execute('''SELECT
             %s FROM system.tables WHERE database == '%s' AND name = '%s'
             ''' % ((column,) + tuple(dbname.split('.'))))[0]
-
-        formatted = sqlparse.format(value, **sqlparse_format)
-        return formatted, \
-            list(tokenize.generate_tokens(io.StringIO(formatted).readline))
+        return value
 
 ###############################################################################
 class Table(object):
@@ -237,11 +268,11 @@ class MT(Table):
         self.sorting_key = untokenize(s, sorting_key)
 
     def scan(self, client):
-        self._parse_engine(*client.execute_clickhouse_tables_sql_tokens(
-            self.dbname, 'engine_full'))
+        self._parse_engine(*tokenize_sql(client.execute_tables(
+            self.dbname, 'engine_full')))
 
-        self._parse_columns(*client.execute_clickhouse_tables_sql_tokens(
-            self.dbname, 'create_table_query'))
+        self._parse_columns(*tokenize_sql(client.execute_tables(
+            self.dbname, 'create_table_query')))
 
         return self
 
@@ -298,7 +329,7 @@ class MV(Table):
         self.to = ''
         self.fr = ''
 
-    def _parse_create_query(self, s, t):
+    def _parse_create_statement(self, s, t):
         state = 0 # 1 = TO, 2 = full-stop, 3 = FROM, 4 = full stop
         fr, to = [], []
         for x in t:
@@ -374,13 +405,13 @@ class MV(Table):
             r"dict\1('\2'", self.as_select)
 
     def scan(self, client):
-        self._parse_create_query(*client.execute_clickhouse_tables_sql_tokens(
-            self.dbname, 'create_table_query'))
+        self._parse_create_statement(*tokenize_sql(client.execute_tables(
+            self.dbname, 'create_table_query')))
 
         return self
 
     def read(self, s, t):
-        self._parse_create_query(s, t)
+        self._parse_create_statement(s, t)
         return self
 
     def diff(self, other):
@@ -424,7 +455,7 @@ class View(Table):
         self.as_select = ''
         self.fr = ''
 
-    def _parse_create_query(self, s, t):
+    def _parse_create_statement(self, s, t):
         state = 0 # 1 = FROM, 2 = full stop
         fr = []
         for x in t:
@@ -477,13 +508,13 @@ class View(Table):
         self.as_select = re.sub(r'FROM [a-zA-Z0-9_]*\.', 'FROM ', self.as_select)
 
     def scan(self, client):
-        self._parse_create_query(*client.execute_clickhouse_tables_sql_tokens(
-            self.dbname, 'create_table_query'))
+        self._parse_create_statement(*tokenize_sql(client.execute_tables(
+            self.dbname, 'create_table_query')))
 
         return self
 
     def read(self, s, t):
-        self._parse_create_query(s, t)
+        self._parse_create_statement(s, t)
         return self
 
     def diff(self, other):
@@ -548,8 +579,8 @@ class Buffer(Table):
         self.to = '%s.%s' % (db, name)
 
     def scan(self, client):
-        self._parse_engine(*client.execute_clickhouse_tables_sql_tokens(
-            self.dbname, 'engine_full'))
+        self._parse_engine(*tokenize_sql(client.execute_tables(
+            self.dbname, 'engine_full')))
 
         return self
 
@@ -609,8 +640,8 @@ class Dist(Table):
         self.fr = '%s.%s' % (db, name)
 
     def scan(self, client):
-        self._parse_engine(*client.execute_clickhouse_tables_sql_tokens(
-            self.dbname, 'engine_full'))
+        self._parse_engine(*tokenize_sql(client.execute_tables(
+            self.dbname, 'engine_full')))
 
         return self
 
@@ -645,8 +676,8 @@ class Null(Table):
         super().__init__('Null', dbname)
 
     def scan(self, client):
-        self._parse_columns(*client.execute_clickhouse_tables_sql_tokens(
-            self.dbname, 'create_table_query'))
+        self._parse_columns(*tokenize_sql(client.execute_tables(
+            self.dbname, 'create_table_query')))
 
         return self
 
@@ -675,8 +706,8 @@ class TinyLog(Table):
         super().__init__('TinyLog', dbname)
 
     def scan(self, client):
-        self._parse_columns(*client.execute_clickhouse_tables_sql_tokens(
-            self.dbname, 'create_table_query'))
+        self._parse_columns(*tokenize_sql(client.execute_tables(
+            self.dbname, 'create_table_query')))
 
         return self
 
@@ -706,7 +737,7 @@ class Keeper(Table):
 
         self.node_path = ''
 
-    def _parse_engine(self, s, t):
+    def _parse_path(self, s, t):
         node_path = ''
         for x in t:
             if x.type == token.STRING:
@@ -716,16 +747,16 @@ class Keeper(Table):
         self.node_path = node_path
 
     def scan(self, client):
-        self._parse_engine(*client.execute_clickhouse_tables_sql_tokens(
-            self.dbname, 'engine_full'))
+        self._parse_path(*tokenize_sql(client.execute_tables(
+            self.dbname, 'engine_full')))
 
-        self._parse_columns(*client.execute_clickhouse_tables_sql_tokens(
-            self.dbname, 'create_table_query'))
+        self._parse_columns(*tokenize_sql(client.execute_tables(
+            self.dbname, 'create_table_query')))
 
         return self
 
     def read(self, s, t):
-        self._parse_engine(s, t)
+        self._parse_path(s, t)
         self._parse_columns(s, t)
         return self
 
@@ -829,7 +860,7 @@ class Dictionary(Table):
             obfuscated = re.sub(r'Bearer [^\']*', 'Bearer TOKEN', padded)
             return obfuscated
 
-    def _parse_create_query(self, s, t):
+    def _parse_create_statement(self, s, t):
         state = 0 # 1 = PRIMARY, 2 = KEY, 3 = SOURCE, 4 = LAYOUT, 5 = LIFETIME
         primary_key, source, layout, lifetime = [], [], [], []
         for x in t:
@@ -863,15 +894,15 @@ class Dictionary(Table):
         self.lifetime = self._parse_lifetime(s, lifetime)
 
     def scan(self, client):
-        (s, t) = client.execute_clickhouse_tables_sql_tokens(
-            self.dbname, 'create_table_query')
+        (s, t) = tokenize_sql(client.execute_tables(
+            self.dbname, 'create_table_query'))
 
-        self._parse_create_query(s, t)
+        self._parse_create_statement(s, t)
         self._parse_columns(s, t)
         return self
 
     def read(self, s, t):
-        self._parse_create_query(s, t)
+        self._parse_create_statement(s, t)
         self._parse_columns(s, t)
         return self
 
@@ -959,8 +990,8 @@ class Kafka(Table):
                         setting = ''
 
     def scan(self, client):
-        (s, t) = client.execute_clickhouse_tables_sql_tokens(
-            self.dbname, 'create_table_query')
+        (s, t) = tokenize_sql(client.execute_tables(
+            self.dbname, 'create_table_query'))
 
         self._parse_engine(s, t)
         return self
@@ -1006,8 +1037,380 @@ class Kafka(Table):
              self.brokers)
 
 ###############################################################################
+class SettingProfile():
+    '''
+    setting profile
+
+    check individual settings
+    '''
+    def __init__(self, name):
+        self.name = name
+        self.settings = {}
+
+    def _parse_settings(self, s, t):
+        state = 0 # 1 = first SETTINGS, 2 = second SETTINGS
+        setting = ''
+        for x in t:
+            if x.type == token.NAME:
+                if state == 0:
+                    if x.string == 'SETTINGS':
+                        state = 1
+                elif state == 1:
+                    if x.string == 'SETTINGS':
+                        state = 2
+                elif state == 2:
+                    if setting == '':
+                        setting = x.string
+                    else:
+                        self.settings[setting] = '%s=%s' % (setting, x.string)
+                        setting = ''
+            else:
+                if state == 2:
+                    if x.exact_type not in [
+                        token.EQUAL, token.COMMA, token.ENDMARKER, token.NEWLINE]:
+                        self.settings[setting] = '%s=%s' % \
+                            (setting, format_numeric_constant(x.string))
+                        setting = ''
+
+    def scan(self, client):
+        ((stmt,),) = client.execute('SHOW CREATE SETTINGS PROFILE `%s`' % self.name)
+        self._parse_settings(*tokenize_sql(stmt))
+        return self
+
+    def read(self, s, t):
+        self._parse_settings(s, t)
+        return self
+
+    def diff(self, other):
+        ret = []
+        for setting in set(self.settings.values()) ^ set(other.settings.values()):
+            ret += [setting]
+
+        return ret
+
+    def __str__(self):
+        return '%s %s' % (self.name, ','.join(self.settings.values()))
+
+###############################################################################
+class Quota():
+    '''
+    quota
+
+    check quota details (as string) and assignee
+    '''
+    def __init__(self, name):
+        self.name = name
+        self.tracking = False
+        self.entity = '' # user or role
+        self.limits = []
+
+    def _parse_create_statement(self, s, t):
+        state = 0 # 1 = FOR, 2 = INTERVAL, 3 = TRACKING, 4 = MAX, 5 = TO, 6 = entity
+        interval = []
+        resource = ''
+        for i, x in enumerate(t):
+            if state == 5:
+                self.entity = extract_name_plain_or_backticks(s, t[i:])
+                state = 6
+            elif x.type == token.NAME:
+                if state == 0:
+                    if x.string == 'FOR':
+                        state = 1
+                elif state == 1:
+                    if x.string == 'INTERVAL':
+                        state = 2
+                        interval = []
+                elif state == 2:
+                    if x.string == 'MAX':
+                        state = 4
+                    elif x.string == 'TRACKING':
+                        state = 3
+                        self.tracking = True
+                    else:
+                        interval += [x.string.upper()]
+                elif state == 4:
+                    if x.string == 'FOR':
+                        state = 1
+                    elif x.string == 'TO':
+                        state = 5
+                    else:
+                        if resource == '':
+                            resource = x.string
+                        else:
+                            self.limits += ['INTERVAL %s %s=%s' % \
+                                (' '.join(interval), resource, x.string)]
+                            resource = ''
+            else:
+                if state == 2:
+                    if x.exact_type == token.NUMBER:
+                        interval += [x.string]
+                elif state == 4:
+                    if x.exact_type not in [
+                        token.EQUAL, token.COMMA, token.ENDMARKER, token.NEWLINE]:
+                        self.limits += ['INTERVAL %s %s=%s' % \
+                            (' '.join(interval), resource, x.string)]
+                        resource = ''
+
+    def scan(self, client):
+        ((stmt,),) = client.execute('SHOW CREATE QUOTA `%s`' % self.name)
+        self._parse_create_statement(*tokenize_sql(stmt))
+        return self
+
+    def read(self, s, t):
+        self._parse_create_statement(s, t)
+        return self
+
+    def diff(self, other):
+        ret = []
+
+        if self.tracking != other.tracking:
+            ret += ['tracking ("%s" "%s")' % (self.tracking, other.tracking)]
+
+        if self.entity != other.entity:
+            ret += ['entity ("%s" "%s")' % (self.entity, other.entity)]
+
+        for limit in set(self.limits) ^ set(other.limits):
+            ret += [limit]
+
+        return ret
+
+    def __str__(self):
+        if self.tracking:
+            return '%s TRACKING' % self.name
+        else:
+            return '%s %s TO %s' % (
+                self.name,
+                ','.join(self.limits),
+                self.entity
+            )
+
+###############################################################################
+class Grant():
+    '''
+    grant
+
+    check permissions (as string) and the WITH GRANT OPTION clause
+    '''
+    def __init__(self):
+        self.grantee = ''
+        self.permissions = ''
+        self.with_grant_option = False
+
+    def _parse_permissions(self, s, t):
+        state = 0 # 1 GRANT, 2 = TO, 3 = name, 4 = WITH, 5 = GRANT, 6 = OPTION
+        permissions = []
+        for i, x in enumerate(t):
+            if state == 2:
+                self.grantee = extract_name_plain_or_backticks(s, t[i:])
+                state = 3
+            elif x.type == token.NAME:
+                if state == 0:
+                    if x.string == 'GRANT':
+                        state = 1
+                elif state == 1:
+                    if x.string == 'TO':
+                        state = 2
+                    else:
+                        permissions += [x]
+                elif state == 3:
+                    if x.string == 'WITH':
+                        state = 4
+                elif state == 4:
+                    if x.string == 'GRANT':
+                        state = 5
+                elif state == 5:
+                    if x.string == 'OPTION':
+                        self.with_grant_option = True
+                        state = 6
+            else:
+                if state == 1:
+                    permissions += [x]
+        self.permissions = untokenize(s, permissions)
+
+    def scan(self, stmt):
+        self._parse_permissions(*tokenize_sql(stmt))
+        return self
+
+    def read(self, s, t):
+        self._parse_permissions(s, t)
+        return self
+
+    def __str__(self):
+        return \
+            'GRANT %s TO %s%s' % \
+            (self.permissions,
+             self.grantee,
+             ' WITH GRANT OPTION' if self.with_grant_option else '')
+
+class Grants(): # grants are a list unlike other statements
+    def __init__(self):
+        self.grants = []
+
+    def append(self, grant):
+        self.grants += [grant]
+
+    def diff(self, other):
+        ret = []
+
+        if len(self.grants) > 0 and len(other.grants) > 0:
+            diff = list(difflib.unified_diff(sorted(self.str()),
+                sorted(other.str()), n=0, lineterm=''))
+            if len(diff) > 0:
+                return ['grants: ' + ' '.join(diff)]
+        elif len(self.grants) > 0 or len(others.grants) > 0:
+            ret += ['grants (%d %d)' % (len(self.grants), len(other.grants))]
+
+        return ret
+
+    def str(self):
+        return list(map(str, self.grants))
+
+###############################################################################
+class Role():
+    '''
+    role
+
+    no checks
+    '''
+    def __init__(self, name):
+        self.name = name
+        self.settings = {}
+
+    def _parse_settings(self, s, t):
+        state = 0 # 1 = SETTINGS
+        setting = ''
+        for x in t:
+            if x.type == token.NAME:
+                if state == 0:
+                    if x.string == 'SETTINGS':
+                        state = 1
+                elif state == 1:
+                    if setting == '':
+                        setting = x.string
+                    else:
+                        self.settings[setting] = '%s=%s' % \
+                            (setting, bool_as_integer(x.string))
+                        setting = ''
+            elif state == 1:
+                # ERRORTOKEN takes care of backticks
+                if x.exact_type not in [
+                    token.ERRORTOKEN, token.EQUAL, token.COMMA, token.ENDMARKER, token.NEWLINE]:
+                    self.settings[setting] = '%s=%s' % \
+                        (setting, format_numeric_constant(x.string))
+                    setting = ''
+
+    def scan(self, client):
+        ((stmt,),) = client.execute('SHOW CREATE ROLE `%s`' % self.name)
+        self._parse_settings(*tokenize_sql(stmt))
+        return self
+
+    def read(self, s, t):
+        self._parse_settings(s, t)
+        return self
+
+    def diff(self, other):
+        ret = []
+        for setting in set(self.settings.values()) ^ set(other.settings.values()):
+            ret += [setting]
+
+        return ret
+
+    def __str__(self):
+        return '%s SETTINGS %s' % (self.name, ','.join(self.settings.values()))
+
+###############################################################################
+class User():
+    '''
+    user account
+
+    check settings, setting profiles, authentication type
+    '''
+    def __init__(self, name):
+        self.name = name
+        self.type = ''
+        self.settings = {}
+        self.setting_profile = ''
+
+    def _parse_create_statement(self, s, t):
+        state = 0 # 1 = IDENTIFIED, 2 = WITH, 3 = type
+                  # 4 = SETTINGS, 5 = PROFILE
+        setting = ''
+        for x in t:
+            if x.type == token.NAME:
+                if state == 0:
+                    if x.string == 'IDENTIFIED':
+                        state = 1
+                elif state == 1:
+                    if x.string == 'WITH':
+                        state = 2
+                elif state == 2:
+                    self.type = x.string
+                    state = 3
+                elif state == 3:
+                    if x.string == 'SETTINGS':
+                        state = 4
+                elif state == 4:
+                    if x.string == 'PROFILE':
+                        state = 5
+                    else:
+                        if setting == '':
+                            setting = x.string
+                        else:
+                            self.settings[setting] = '%s=%s' % \
+                                (setting, bool_as_integer(x.string))
+                            setting = ''
+                elif state == 5:
+                    self.setting_profile = x.string
+                    state = 4
+            else:
+                if state == 4:
+                    # ERRORTOKEN takes care of backticks
+                    if x.exact_type not in [
+                        token.ERRORTOKEN, token.EQUAL, token.COMMA, token.ENDMARKER, token.NEWLINE]:
+                        self.settings[setting] = '%s=%s' % \
+                            (setting, format_numeric_constant(x.string))
+                        setting = ''
+
+    def scan(self, client):
+        ((stmt,),) = client.execute('SHOW CREATE USER `%s`' % self.name)
+        self._parse_create_statement(*tokenize_sql(stmt))
+
+        return self
+
+    def read(self, s, t):
+        self._parse_create_statement(s, t)
+        return self
+
+    def diff(self, other):
+        ret = []
+
+        if self.type != other.type:
+            ret += ['type ("%s" "%s")' % (self.type, other.type)]
+
+        if self.setting_profile != other.setting_profile:
+            ret += ['setting profile ("%s" "%s")' % \
+                    (self.setting_profile, other.setting_profile)]
+
+        for setting in set(self.settings.values()) ^ set(other.settings.values()):
+            ret += [setting]
+
+        return ret
+
+    def __str__(self):
+        return \
+            '%s %s%s' % \
+            (self.name,
+             self.type,
+             ' %s' % self.setting_profile if self.setting_profile else '')
+
+###############################################################################
 class Model(object):
     def __init__(self):
+        self.users = {}
+        self.roles = {}
+        self.grants = {}
+        self.setting_profiles = {}
+        self.quotas = {}
         self.mt = {}
         self.mv = {}
         self.view = {}
@@ -1019,7 +1422,7 @@ class Model(object):
         self.dictionary = {}
         self.kafka = {}
 
-    def all_tables(self):
+    def tables(self):
         return \
             self.mt | self.mv | self.view | self.buffer | self.dist | \
             self.null | self.tiny | self.keeper | self.dictionary | self.kafka
@@ -1055,15 +1458,6 @@ class Model(object):
             else:
                 print('warning: %s: ignore unrecognised engine: %s' % (dbname, engine))
 
-    def _scan_tables(self, client, db):
-        for (table,) in client.execute('SHOW TABLES FROM %s' % db):
-            self._scan_table(client, '%s.%s' % (db, table))
-
-    def _scan_databases(self, client):
-        for (db,) in client.execute('SHOW DATABASES'):
-            if db not in ['information_schema', 'INFORMATION_SCHEMA', 'system']:
-                self._scan_tables(client, db)
-
     def _verify_dependencies(self):
         for dbname, mv in self.mv.items():
             if mv.fr not in (self.mt | self.null | self.kafka):
@@ -1074,7 +1468,30 @@ class Model(object):
                   (dbname, mv.to))
 
     def scan(self, client):
-        self._scan_databases(client)
+        for (name,) in client.execute('SHOW USERS'):
+            self.users[name] = User(name).scan(client)
+
+        for (name,) in client.execute('SHOW ROLES'):
+            self.roles[name] = Role(name).scan(client)
+
+        for (stmt,) in client.execute('SHOW GRANTS FOR ALL'):
+            grant = Grant().scan(stmt)
+            self.grants.setdefault(grant.grantee, Grants())
+            self.grants[grant.grantee].append(grant)
+
+        for (name,) in client.execute('SHOW SETTINGS PROFILES'):
+            # heuristic: skip the preconfigured profiles
+            if not name in ['default', 'readonly']:
+                self.setting_profiles[name] = SettingProfile(name).scan(client)
+
+        for (name,) in client.execute('SHOW QUOTAS'):
+            if name != 'default': # heuristic: skip the built-in quota
+                self.quotas[name] = Quota(name).scan(client)
+
+        for (db,) in client.execute('SHOW DATABASES'):
+            if db not in ['information_schema', 'INFORMATION_SCHEMA', 'system']:
+                for (table,) in client.execute('SHOW TABLES FROM %s' % db):
+                    self._scan_table(client, '%s.%s' % (db, table))
 
         self._verify_dependencies()
         return self
@@ -1117,43 +1534,70 @@ class Model(object):
     def _read_create_statement(self, s, t):
         if t[1].string == 'MATERIALIZED' and t[2].string == 'VIEW':
             dbname = self._read_dbname(t[3:])
-            engine = 'MaterializedView'
+            kind = 'MaterializedView'
         elif t[1].string == 'DICTIONARY':
             dbname = self._read_dbname(t[2:])
-            engine = 'Dictionary'
+            kind = 'Dictionary'
         elif t[1].string == 'VIEW':
             dbname = self._read_dbname(t[2:])
-            engine = 'View'
+            kind = 'View'
         elif t[1].string == 'TABLE':
             dbname = self._read_dbname(t[2:])
-            engine = self._read_engine(t)
+            kind = self._read_engine(t)
+        elif t[1].string == 'USER':
+            name = extract_name_plain_or_backticks(s, t[2:])
+            kind = 'User'
+        elif t[1].string == 'ROLE':
+            name = t[2].string
+            kind = 'Role'
+        elif t[1].string == 'SETTINGS' and t[2].string == 'PROFILE':
+            name = t[3].string
+            kind = 'SettingProfile'
+        elif t[1].string == 'QUOTA':
+            name = t[2].string
+            kind = 'Quota'
         else:
             return
 
-        if engine.endswith('MergeTree'):
-            self.mt[dbname] = MT(dbname, engine).read(s, t)
-        elif engine == 'MaterializedView':
+        if kind.endswith('MergeTree'):
+            self.mt[dbname] = MT(dbname, kind).read(s, t)
+        elif kind == 'MaterializedView':
             self.mv[dbname] = MV(dbname).read(s, t)
-        elif engine == 'View':
+        elif kind == 'View':
             self.view[dbname] = View(dbname).read(s, t)
-        elif engine == 'Buffer':
+        elif kind == 'Buffer':
             self.buffer[dbname] = Buffer(dbname).read(s, t)
-        elif engine == 'Distributed':
+        elif kind == 'Distributed':
             self.dist[dbname] = Dist(dbname).read(s, t)
-        elif engine == 'Null':
+        elif kind == 'Null':
             self.null[dbname] = Null(dbname).read(s, t)
-        elif engine == 'TinyLog':
+        elif kind == 'TinyLog':
             self.tiny[dbname] = TinyLog(dbname).read(s, t)
-        elif engine == 'KeeperMap':
+        elif kind == 'KeeperMap':
             self.keeper[dbname] = Keeper(dbname).read(s, t)
-        elif engine == 'Dictionary':
+        elif kind == 'Dictionary':
             self.dictionary[dbname] = Dictionary(dbname).read(s, t)
-        elif engine == 'Kafka':
+        elif kind == 'Kafka':
             self.kafka[dbname] = Kafka(dbname).read(s, t)
+        elif kind == 'User':
+            self.users[name] = User(name).read(s, t)
+        elif kind == 'Role':
+            self.roles[name] = Role(name).read(s, t)
+        elif kind == 'SettingProfile':
+            self.setting_profiles[name] = SettingProfile(name).read(s, t)
+        elif kind == 'Quota':
+            self.quotas[name] = Quota(name).read(s, t)
+
+    def _read_grant_statement(self, s, t):
+        grant = Grant().read(s, t)
+        self.grants.setdefault(grant.grantee, Grants())
+        self.grants[grant.grantee].append(grant)
 
     def _read_statement(self, s, t):
         if t[0].string == 'CREATE':
             self._read_create_statement(s, t)
+        elif t[0].string == 'GRANT':
+            self._read_grant_statement(s, t)
 
     def read(self, files):
         for file in files:
@@ -1166,14 +1610,19 @@ class Model(object):
         return self
 
     def __str__(self):
-        return '\n'.join([str(x) for x in self.all_tables().values()])
+        return '\n'.join([str(x) for x in self.tables().values()])
 
 ###############################################################################
 def __main__():
     if len(sys.argv) < 3:
         print('''usage: sql-diff [-u USER -p PASSWORD] HOST FILE ...
 one or more FILEs contain CREATE statements to diff against
-port number in HOST is excluded (9000 will be used)''')
+
+remarks:
+- port number in HOST is excluded (9000 will be used)
+- has no way of checking user passwords
+- SHOW DATABASES/TABLES permission determines tables to check
+''')
         sys.exit(2)
 
     if len(sys.argv) >= 7 and sys.argv[1] == '-u' and sys.argv[3] == '-p':
@@ -1185,27 +1634,36 @@ port number in HOST is excluded (9000 will be used)''')
         host = sys.argv[1]
         files = sys.argv[2:]
 
-    live = Model().scan(Client(host=host, port=9000,
+    secure = False
+    port = 9440 if secure else 9000
+
+    live = Model().scan(Client(host=host,
+        port=port, secure=secure,
         user=credentials[0], password=credentials[1]))
 
     repo = Model().read(files)
 
-    longest_name = len(max(live.all_tables().keys(), key=len)) + 2
+    def diff(repo, live, what):
+        longest_name = len(max(live.keys(), key=len)) + 2 if len(live) else ''
+        for i in live.keys():
+            print(('%%-%ds' % longest_name) % i, end='')
 
-    for tl in live.all_tables().values():
-        print(('%%-%ds' % longest_name) % tl.dbname, end='')
+            if i not in repo:
+                print('no such %s found in files' % what)
+                continue
 
-        try:
-            tf = repo.all_tables()[tl.dbname]
-        except KeyError:
-            print('no such table found in files')
-            continue
+            ret = repo[i].diff(live[i])
+            if len(ret) > 0:
+                print(', '.join(ret))
+                continue
 
-        ret = tf.diff(tl)
-        if len(ret) > 0:
-            print(', '.join(ret))
-            continue
+            print('OK')
 
-        print('OK')
+    diff(repo.users, live.users, 'user')
+    diff(repo.roles, live.roles, 'role')
+    diff(repo.grants, live.grants, 'grant')
+    diff(repo.setting_profiles, live.setting_profiles, 'setting profile')
+    diff(repo.quotas, live.quotas, 'quota')
+    diff(repo.tables(), live.tables(), 'table')
 
 __main__()
