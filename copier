@@ -1,11 +1,13 @@
 #!/bin/zsh
-if [[ $1 == --dry-run ]] ; then
-  dry_run=1
+while [[ $1 =~ -- ]] ; do
+  case $1 in
+    --dry-run) dry_run=1;;
+    --allow-materializedview) allow_materializedview=1;;
+    --incremental) incremental=1;;
+    *) print unknown option $1; exit 1;;
+  esac
   shift
-elif [[ $1 == --allow-materializedview ]] ; then
-  allow_materializedview=1
-  shift
-fi
+done
 
 if (( $# != 8 )) ; then
   print "\
@@ -15,20 +17,21 @@ ClickHouse idempotent data copy
 
 copy FOO table on ALICE to BAR table on BOB
 
-  - interate over all DAY arguments against TIMESTAMP column
+  - DAY argument against TIMESTAMP column
   - validate by counting AGGREGATE expression, success means abs(a-b)/a < RATIO
+  - delete, validate and insert one hour at a time
   - username 'copier' with password read from \$HOME/.copier
 
 OPTIONS
 
-  --dry-run                 just compare, without deleting or copying
+  --dry-run                 just compare, without deleting or inserting
   --allow-materializedview  treat detected MVs as a warning rather than error
+  --incremental             only delete and insert hours that fail validation
 
 remarks:
 
   - objective is robustness not speed, scale by running multiple concurrently
   - sleep N seconds if \$HOME/.copier-sleep exists containing the number N
-  - delete, validate and insert one hour at a time
   - print the word OK for each hour completed
   - print a summary starting with the word successfully at the end
   - recommend user be read-only on ALICE (in case accidentally swapped)
@@ -41,7 +44,7 @@ remarks:
 
 example:
 
-  $0 copier bob txns txns ts sumMerge\\\\(val\\\\) 0.01 2025-09-01" 1>&2
+  $0 copier bob txns txns ts sumMerge\\\\(val\\\\) 0.01 2026-09-01" 1>&2
   exit 2
 fi
 
@@ -235,7 +238,7 @@ for hh in {00..23} ; do
     (( retry < 5 )) && print retry number $(( 5 - retry ))
     let retry--
 
-    # get source row count and skip if zero (not this breaks dry run)
+    # get source row count and skip if zero (note this breaks dry run)
     arows=$(client -h $hsrc -q "
       SELECT count() FROM $tsrc WHERE $timespec
     ")
@@ -274,18 +277,20 @@ for hh in {00..23} ; do
       continue
     fi
     print bob has $bagg
-    if (( aagg == 0 )) ; then
-      if (( bagg == 0 )) ; then
-        print OK: zero aggregate
+    if [[ -n $incremental || -n $dry_run ]] ; then
+      if (( aagg == 0 )) ; then
+        if (( bagg == 0 )) ; then
+          print OK: zero aggregate
+          let oks++
+          retry=0
+          continue
+        fi
+      elif (( 1.0 * abs(bagg - aagg) / aagg < ratio )) ; then
+        print OK: equality
         let oks++
         retry=0
         continue
       fi
-    elif (( 1.0 * abs(bagg - aagg) / aagg < ratio )) ; then
-      print OK: equality
-      let oks++
-      retry=0
-      continue
     fi
 
     if [[ -z $dry_run ]] ; then
@@ -299,10 +304,10 @@ for hh in {00..23} ; do
         continue
       fi
 
-      if (( brows == 0 )) ; then
-        print zero row count at $hdst so skip erase
+      if [[ -n $incremental && $brows = 0 ]] ; then
+        print zero row count and incremental at $hdst so skip erase
       else
-        print needs erasing \($brows rows\)
+        [[ -n $incremental ]] && print needs erasing \($brows rows\)
 
         # erase whole hour, if needed - issue a synchronous alter-delete
         settings="SETTINGS mutations_sync = 2"
