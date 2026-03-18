@@ -196,7 +196,7 @@ class MT(Table):
         self.sorting_key = ''
 
     def _parse_engine(self, s, t):
-        state = 0 # 1 = MergeTree, 2 = TTL, 3 = SETTINGS
+        state = 0 # 1 = MergeTree, 2 = TTL, 3 = SETTINGS, 4 = COMMENT
         setting = ''
         ttl = []
         for x in t:
@@ -211,6 +211,9 @@ class MT(Table):
                     continue
                 elif x.string == 'SETTINGS':
                     state = 3
+                    continue
+                elif x.string == 'COMMENT':
+                    state = 4
                     continue
                 elif x.string in ['PARTITION', 'ORDER', 'PRIMARY']:
                     state = 1 # quick & dirty heuristic to end TTL/SETTINGS clause
@@ -257,7 +260,7 @@ class MT(Table):
                         continue
                     else:
                         state = 0
-                elif x.string in ['TTL', 'SETTINGS', 'KEY', 'PRIMARY']:
+                elif x.string in ['TTL', 'SETTINGS', 'COMMENT', 'KEY', 'PRIMARY']:
                     state = 0 # quick & dirty heuristic
             if state == 2:
                 partition_key += [x]
