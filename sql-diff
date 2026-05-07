@@ -1618,7 +1618,7 @@ class Model(object):
 ###############################################################################
 def __main__():
     if len(sys.argv) < 3:
-        print('''usage: sql-diff [-u USER -p PASSWORD] HOST FILE ...
+        print('''usage: sql-diff [--plain-http] [-u USER -p PASSWORD] HOST FILE ...
 one or more FILEs contain CREATE statements to diff against
 
 remarks:
@@ -1627,6 +1627,11 @@ remarks:
 - SHOW DATABASES/TABLES permission determines tables to check
 ''')
         sys.exit(2)
+
+    secure = True
+    if sys.argv[1] == '--plain-http':
+        secure = False
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
 
     if len(sys.argv) >= 7 and sys.argv[1] == '-u' and sys.argv[3] == '-p':
         credentials = (sys.argv[2], sys.argv[4])
@@ -1637,7 +1642,6 @@ remarks:
         host = sys.argv[1]
         files = sys.argv[2:]
 
-    secure = False
     port = 9440 if secure else 9000
 
     live = Model().scan(Client(host=host,
