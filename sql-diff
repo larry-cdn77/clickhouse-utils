@@ -1537,58 +1537,58 @@ class Model(object):
     def _read_create_statement(self, s, t):
         if t[1].string == 'MATERIALIZED' and t[2].string == 'VIEW':
             dbname = self._read_dbname(t[3:])
-            kind = 'MaterializedView'
+            entity = 'MaterializedView'
         elif t[1].string == 'DICTIONARY':
             dbname = self._read_dbname(t[2:])
-            kind = 'Dictionary'
+            entity = 'Dictionary'
         elif t[1].string == 'VIEW':
             dbname = self._read_dbname(t[2:])
-            kind = 'View'
+            entity = 'View'
         elif t[1].string == 'TABLE':
             dbname = self._read_dbname(t[2:])
-            kind = self._read_engine(t)
+            entity = self._read_engine(t)
         elif t[1].string == 'USER':
             name = extract_name_plain_or_backticks(s, t[2:])
-            kind = 'User'
+            entity = 'User'
         elif t[1].string == 'ROLE':
             name = t[2].string
-            kind = 'Role'
+            entity = 'Role'
         elif t[1].string == 'SETTINGS' and t[2].string == 'PROFILE':
             name = t[3].string
-            kind = 'SettingProfile'
+            entity = 'SettingProfile'
         elif t[1].string == 'QUOTA':
             name = t[2].string
-            kind = 'Quota'
+            entity = 'Quota'
         else:
             return
 
-        if kind.endswith('MergeTree'):
-            self.mt[dbname] = MT(dbname, kind).read(s, t)
-        elif kind == 'MaterializedView':
+        if entity.endswith('MergeTree'):
+            self.mt[dbname] = MT(dbname, entity).read(s, t)
+        elif entity == 'MaterializedView':
             self.mv[dbname] = MV(dbname).read(s, t)
-        elif kind == 'View':
+        elif entity == 'View':
             self.view[dbname] = View(dbname).read(s, t)
-        elif kind == 'Buffer':
+        elif entity == 'Buffer':
             self.buffer[dbname] = Buffer(dbname).read(s, t)
-        elif kind == 'Distributed':
+        elif entity == 'Distributed':
             self.dist[dbname] = Dist(dbname).read(s, t)
-        elif kind == 'Null':
+        elif entity == 'Null':
             self.null[dbname] = Null(dbname).read(s, t)
-        elif kind == 'TinyLog':
+        elif entity == 'TinyLog':
             self.tiny[dbname] = TinyLog(dbname).read(s, t)
-        elif kind == 'KeeperMap':
+        elif entity == 'KeeperMap':
             self.keeper[dbname] = Keeper(dbname).read(s, t)
-        elif kind == 'Dictionary':
+        elif entity == 'Dictionary':
             self.dictionary[dbname] = Dictionary(dbname).read(s, t)
-        elif kind == 'Kafka':
+        elif entity == 'Kafka':
             self.kafka[dbname] = Kafka(dbname).read(s, t)
-        elif kind == 'User':
+        elif entity == 'User':
             self.users[name] = User(name).read(s, t)
-        elif kind == 'Role':
+        elif entity == 'Role':
             self.roles[name] = Role(name).read(s, t)
-        elif kind == 'SettingProfile':
+        elif entity == 'SettingProfile':
             self.setting_profiles[name] = SettingProfile(name).read(s, t)
-        elif kind == 'Quota':
+        elif entity == 'Quota':
             self.quotas[name] = Quota(name).read(s, t)
 
     def _read_grant_statement(self, s, t):
@@ -1618,19 +1618,26 @@ class Model(object):
 ###############################################################################
 def __main__():
     if len(sys.argv) < 3:
-        print('''usage: sql-diff [--plain-http] [-u USER -p PASSWORD] HOST FILE ...
+        print('''usage: sql-diff [--plain-http] [--reverse] [-u USER -p PASSWORD] HOST FILE ...
 one or more FILEs contain CREATE statements to diff against
 
 remarks:
 - port number in HOST is excluded (9000 will be used)
 - has no way of checking user passwords
 - SHOW DATABASES/TABLES permission determines tables to check
+- reverse mode iterates over create statements in files rather than live target
+  then it diffs with files on the left and live target on the right
 ''')
         sys.exit(2)
 
     secure = True
     if sys.argv[1] == '--plain-http':
         secure = False
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
+
+    reverse = False
+    if sys.argv[1] == '--reverse':
+        reverse = True
         sys.argv = [sys.argv[0]] + sys.argv[2:]
 
     if len(sys.argv) >= 7 and sys.argv[1] == '-u' and sys.argv[3] == '-p':
@@ -1650,27 +1657,38 @@ remarks:
 
     repo = Model().read(files)
 
-    def diff(repo, live, what):
-        longest_name = len(max(live.keys(), key=len)) + 2 if len(live) else ''
-        for i in live.keys():
+    def diff(iterable, left, right, kind):
+        longest_name = \
+            len(max(iterable.keys(), key=len)) + 2 if len(iterable) else ''
+
+        for i in iterable.keys():
             print(('%%-%ds' % longest_name) % i, end='')
 
-            if i not in repo:
-                print('no such %s found in files' % what)
+            if i not in left:
+                print('no such %s found' % kind)
                 continue
 
-            ret = repo[i].diff(live[i])
+            ret = left[i].diff(right[i])
             if len(ret) > 0:
                 print(', '.join(ret))
                 continue
 
             print('OK')
 
-    diff(repo.users, live.users, 'user')
-    diff(repo.roles, live.roles, 'role')
-    diff(repo.grants, live.grants, 'grant')
-    diff(repo.setting_profiles, live.setting_profiles, 'setting profile')
-    diff(repo.quotas, live.quotas, 'quota')
-    diff(repo.tables(), live.tables(), 'table')
+    if reverse:
+        iterable = repo
+        left = live
+        right = repo
+    else:
+        iterable = live
+        left = repo
+        right = live
+
+    diff(iterable.users, left.users, right.users, 'user')
+    diff(iterable.roles, left.roles, right.roles, 'role')
+    diff(iterable.grants, left.grants, right.grants, 'grant')
+    diff(iterable.setting_profiles, left.setting_profiles, right.setting_profiles, 'setting profile')
+    diff(iterable.quotas, left.quotas, right.quotas, 'quota')
+    diff(iterable.tables(), left.tables(), right.tables(), 'table')
 
 __main__()
