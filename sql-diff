@@ -119,18 +119,6 @@ def tokenize_sql(expression):
         list(tokenize.generate_tokens(io.StringIO(formatted).readline))
 
 ###############################################################################
-class Client(clickhouse_driver.Client):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-    def execute_tables(self, dbname, column):
-        (value,) = \
-            self.execute('''SELECT
-            %s FROM system.tables WHERE database == '%s' AND name = '%s'
-            ''' % ((column,) + tuple(dbname.split('.'))))[0]
-        return value
-
-###############################################################################
 class Table(object):
     def __init__(self, engine, dbname):
         self.engine = engine
@@ -270,13 +258,9 @@ class MT(Table):
         self.partition_key = untokenize(s, partition_key)
         self.sorting_key = untokenize(s, sorting_key)
 
-    def scan(self, client):
-        self._parse_engine(*tokenize_sql(client.execute_tables(
-            self.dbname, 'engine_full')))
-
-        self._parse_columns(*tokenize_sql(client.execute_tables(
-            self.dbname, 'create_table_query')))
-
+    def scan(self, engine_full, create_table_query):
+        self._parse_engine(*tokenize_sql(engine_full))
+        self._parse_columns(*tokenize_sql(create_table_query))
         return self
 
     def read(self, s, t):
@@ -407,10 +391,8 @@ class MV(Table):
         self.as_select = re.sub(r"dict(Get|Has)\('default\.([^']*)'",
             r"dict\1('\2'", self.as_select)
 
-    def scan(self, client):
-        self._parse_create_statement(*tokenize_sql(client.execute_tables(
-            self.dbname, 'create_table_query')))
-
+    def scan(self, create_table_query):
+        self._parse_create_statement(*tokenize_sql(create_table_query))
         return self
 
     def read(self, s, t):
@@ -510,10 +492,8 @@ class View(Table):
         # heuristic: remove explicit 'default.' in from-table
         self.as_select = re.sub(r'FROM [a-zA-Z0-9_]*\.', 'FROM ', self.as_select)
 
-    def scan(self, client):
-        self._parse_create_statement(*tokenize_sql(client.execute_tables(
-            self.dbname, 'create_table_query')))
-
+    def scan(self, create_table_query):
+        self._parse_create_statement(*tokenize_sql(create_table_query))
         return self
 
     def read(self, s, t):
@@ -581,10 +561,8 @@ class Buffer(Table):
         #print('+', '%s.%s' % (db, name), '"%s"' % s)
         self.to = '%s.%s' % (db, name)
 
-    def scan(self, client):
-        self._parse_engine(*tokenize_sql(client.execute_tables(
-            self.dbname, 'engine_full')))
-
+    def scan(self, engine_full):
+        self._parse_engine(*tokenize_sql(engine_full))
         return self
 
     def read(self, s, t):
@@ -642,10 +620,8 @@ class Dist(Table):
         #print('+', '%s.%s' % (db, name), '"%s"' % s)
         self.fr = '%s.%s' % (db, name)
 
-    def scan(self, client):
-        self._parse_engine(*tokenize_sql(client.execute_tables(
-            self.dbname, 'engine_full')))
-
+    def scan(self, engine_full):
+        self._parse_engine(*tokenize_sql(engine_full))
         return self
 
     def read(self, s, t):
@@ -678,10 +654,8 @@ class Null(Table):
     def __init__(self, dbname):
         super().__init__('Null', dbname)
 
-    def scan(self, client):
-        self._parse_columns(*tokenize_sql(client.execute_tables(
-            self.dbname, 'create_table_query')))
-
+    def scan(self, create_table_query):
+        self._parse_columns(*tokenize_sql(create_table_query))
         return self
 
     def read(self, s, t):
@@ -708,10 +682,8 @@ class TinyLog(Table):
     def __init__(self, dbname):
         super().__init__('TinyLog', dbname)
 
-    def scan(self, client):
-        self._parse_columns(*tokenize_sql(client.execute_tables(
-            self.dbname, 'create_table_query')))
-
+    def scan(self, create_table_query):
+        self._parse_columns(*tokenize_sql(create_table_query))
         return self
 
     def read(self, s, t):
@@ -749,13 +721,9 @@ class Keeper(Table):
 
         self.node_path = node_path
 
-    def scan(self, client):
-        self._parse_path(*tokenize_sql(client.execute_tables(
-            self.dbname, 'engine_full')))
-
-        self._parse_columns(*tokenize_sql(client.execute_tables(
-            self.dbname, 'create_table_query')))
-
+    def scan(self, engine_full, create_table_query):
+        self._parse_path(*tokenize_sql(engine_full))
+        self._parse_columns(*tokenize_sql(create_table_query))
         return self
 
     def read(self, s, t):
@@ -896,10 +864,8 @@ class Dictionary(Table):
         self.layout = untokenize(s, layout)
         self.lifetime = self._parse_lifetime(s, lifetime)
 
-    def scan(self, client):
-        (s, t) = tokenize_sql(client.execute_tables(
-            self.dbname, 'create_table_query'))
-
+    def scan(self, create_table_query):
+        (s, t) = tokenize_sql(create_table_query)
         self._parse_create_statement(s, t)
         self._parse_columns(s, t)
         return self
@@ -992,11 +958,8 @@ class Kafka(Table):
                             (setting, format_numeric_constant(x.string))
                         setting = ''
 
-    def scan(self, client):
-        (s, t) = tokenize_sql(client.execute_tables(
-            self.dbname, 'create_table_query'))
-
-        self._parse_engine(s, t)
+    def scan(self, create_table_query):
+        self._parse_engine(*tokenize_sql(create_table_query))
         return self
 
     def read(self, s, t):
@@ -1302,8 +1265,7 @@ class Role():
                         (setting, format_numeric_constant(x.string))
                     setting = ''
 
-    def scan(self, client):
-        ((stmt,),) = client.execute('SHOW CREATE ROLE `%s`' % self.name)
+    def scan(self, stmt):
         self._parse_settings(*tokenize_sql(stmt))
         return self
 
@@ -1374,10 +1336,8 @@ class User():
                             (setting, format_numeric_constant(x.string))
                         setting = ''
 
-    def scan(self, client):
-        ((stmt,),) = client.execute('SHOW CREATE USER `%s`' % self.name)
+    def scan(self, stmt):
         self._parse_create_statement(*tokenize_sql(stmt))
-
         return self
 
     def read(self, s, t):
@@ -1430,36 +1390,33 @@ class Model(object):
             self.mt | self.mv | self.view | self.buffer | self.dist | \
             self.null | self.tiny | self.keeper | self.dictionary | self.kafka
 
-    def _scan_table(self, client, dbname):
-        for (engine,) in client.execute('''SELECT engine FROM system.tables
-            WHERE database == '%s' AND name = '%s'
-            ''' % tuple(dbname.split('.'))):
-            if engine.endswith('MergeTree'):
-                self.mt[dbname] = MT(dbname, engine).scan(client)
-            elif engine == 'MaterializedView':
-                self.mv[dbname] = MV(dbname).scan(client)
-            elif engine == 'View':
-                self.view[dbname] = View(dbname).scan(client)
-            elif engine == 'Buffer':
-                self.buffer[dbname] = Buffer(dbname).scan(client)
-            elif engine == 'Distributed':
-                self.dist[dbname] = Dist(dbname).scan(client)
-            elif engine == 'Null':
-                self.null[dbname] = Null(dbname).scan(client)
-            elif engine == 'TinyLog':
-                self.tiny[dbname] = TinyLog(dbname).scan(client)
-            elif engine == 'KeeperMap':
-                self.keeper[dbname] = Keeper(dbname).scan(client)
-            elif engine == 'Dictionary':
-                self.dictionary[dbname] = Dictionary(dbname).scan(client)
-            elif engine == 'Kafka':
-                self.kafka[dbname] = Kafka(dbname).scan(client)
-            elif engine == 'PostgreSQL':
-                # silently ignore PostgreSQL engine
-                # (virtual tables dynamically populated in PostgreSQL database)
-                pass
-            else:
-                print('warning: %s: ignore unrecognised engine: %s' % (dbname, engine))
+    def _scan_table(self, dbname, engine,  engine_full, create_table_query):
+        if engine.endswith('MergeTree'):
+            self.mt[dbname] = MT(dbname, engine).scan(engine_full, create_table_query)
+        elif engine == 'MaterializedView':
+            self.mv[dbname] = MV(dbname).scan(create_table_query)
+        elif engine == 'View':
+            self.view[dbname] = View(dbname).scan(create_table_query)
+        elif engine == 'Buffer':
+            self.buffer[dbname] = Buffer(dbname).scan(engine_full)
+        elif engine == 'Distributed':
+            self.dist[dbname] = Dist(dbname).scan(engine_full)
+        elif engine == 'Null':
+            self.null[dbname] = Null(dbname).scan(create_table_query)
+        elif engine == 'TinyLog':
+            self.tiny[dbname] = TinyLog(dbname).scan(create_table_query)
+        elif engine == 'KeeperMap':
+            self.keeper[dbname] = Keeper(dbname).scan(engine_full, create_table_query)
+        elif engine == 'Dictionary':
+            self.dictionary[dbname] = Dictionary(dbname).scan(create_table_query)
+        elif engine == 'Kafka':
+            self.kafka[dbname] = Kafka(dbname).scan(create_table_query)
+        elif engine == 'PostgreSQL':
+            # silently ignore PostgreSQL engine
+            # (virtual tables dynamically populated in PostgreSQL database)
+            pass
+        else:
+            print('warning: %s: ignore unrecognised engine: %s' % (dbname, engine))
 
     def _verify_dependencies(self):
         for dbname, mv in self.mv.items():
@@ -1471,11 +1428,23 @@ class Model(object):
                   (dbname, mv.to))
 
     def scan(self, client):
-        for (name,) in client.execute('SHOW USERS'):
-            self.users[name] = User(name).scan(client)
+        enumerated = [name for (name,) in client.execute('SHOW USERS')]
+        concatenated = ', '.join(['`%s`' % name for name in enumerated])
+        i = 0 # single-statement shortcut to multiple SHOW CREATE USER
+        for (stmt,) in client.execute('SHOW CREATE USER ' + concatenated):
+            name = enumerated[i]
+            assert re.search(name, stmt) # sanity check
+            self.users[name] = User(name).scan(stmt)
+            i += 1
 
-        for (name,) in client.execute('SHOW ROLES'):
-            self.roles[name] = Role(name).scan(client)
+        enumerated = [name for (name,) in client.execute('SHOW ROLES')]
+        concatenated = ', '.join(['`%s`' % name for name in enumerated])
+        i = 0
+        for (stmt,) in client.execute('SHOW CREATE ROLE ' + concatenated):
+            name = enumerated[i]
+            assert re.search(name, stmt)
+            self.roles[name] = Role(name).scan(stmt)
+            i ++ 1
 
         for (stmt,) in client.execute('SHOW GRANTS FOR ALL'):
             grant = Grant().scan(stmt)
@@ -1491,10 +1460,13 @@ class Model(object):
             if name != 'default': # heuristic: skip the built-in quota
                 self.quotas[name] = Quota(name).scan(client)
 
-        for (db,) in client.execute('SHOW DATABASES'):
-            if db not in ['information_schema', 'INFORMATION_SCHEMA', 'system']:
-                for (table,) in client.execute('SHOW TABLES FROM %s' % db):
-                    self._scan_table(client, '%s.%s' % (db, table))
+        for (db, table, engine, engine_full, create_table_query) in client.execute('''
+            SELECT database, name, engine, engine_full, create_table_query
+            FROM system.tables WHERE NOT database IN
+            ['information_schema', 'INFORMATION_SCHEMA', 'system']
+            '''):
+            self._scan_table('%s.%s' % (db, table),
+                engine, engine_full, create_table_query)
 
         self._verify_dependencies()
         return self
@@ -1651,7 +1623,7 @@ remarks:
 
     port = 9440 if secure else 9000
 
-    live = Model().scan(Client(host=host,
+    live = Model().scan(clickhouse_driver.Client(host=host,
         port=port, secure=secure,
         user=credentials[0], password=credentials[1]))
 
