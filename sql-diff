@@ -120,9 +120,10 @@ def tokenize_sql(expression):
 
 ###############################################################################
 class Table(object):
-    def __init__(self, engine, dbname):
+    def __init__(self, engine, dbname, rawstmt):
         self.engine = engine
         self.dbname = dbname
+        self.rawstmt = rawstmt
         self.columns = []
 
     def _parse_columns(self, s, t):
@@ -165,6 +166,12 @@ class Table(object):
 
         return []
 
+    def raw_diff(self, other):
+        print('+diff')
+        print('++', self.rawstmt)
+        print('++', other.rawstmt)
+        return '\n'.join(difflib.unified_diff(self.rawstmt, other.rawstmt))
+
     def __str__(self):
         return '%s %s' % (self.engine, self.dbname)
 
@@ -175,8 +182,8 @@ class MT(Table):
 
     check engine, columns, TTL, settings, partitioning key and sorting key
     '''
-    def __init__(self, dbname, engine):
-        super().__init__(engine, dbname)
+    def __init__(self, engine, dbname, rawstmt):
+        super().__init__(engine, dbname, rawstmt)
 
         self.ttl = ''
         self.settings = {}
@@ -258,15 +265,14 @@ class MT(Table):
         self.partition_key = untokenize(s, partition_key)
         self.sorting_key = untokenize(s, sorting_key)
 
-    def scan(self, engine_full, create_table_query):
+    def scan(self, engine_full, create_query):
         self._parse_engine(*tokenize_sql(engine_full))
-        self._parse_columns(*tokenize_sql(create_table_query))
+        self._parse_columns(*tokenize_sql(create_query))
         return self
 
     def read(self, s, t):
         self._parse_engine(s, t)
         self._parse_columns(s, t)
-
         return self
 
     def diff(self, other):
@@ -309,8 +315,8 @@ class MV(Table):
 
     check select statement, source table and destionation tables
     '''
-    def __init__(self, dbname):
-        super().__init__('MaterializedView', dbname)
+    def __init__(self, dbname, rawstmt):
+        super().__init__('MaterializedView', dbname, rawstmt)
 
         self.as_select = ''
         self.to = ''
@@ -391,8 +397,8 @@ class MV(Table):
         self.as_select = re.sub(r"dict(Get|Has)\('default\.([^']*)'",
             r"dict\1('\2'", self.as_select)
 
-    def scan(self, create_table_query):
-        self._parse_create_statement(*tokenize_sql(create_table_query))
+    def scan(self, create_query):
+        self._parse_create_statement(*tokenize_sql(create_query))
         return self
 
     def read(self, s, t):
@@ -434,8 +440,8 @@ class View(Table):
 
     check select statement and source table
     '''
-    def __init__(self, dbname):
-        super().__init__('MaterializedView', dbname)
+    def __init__(self, dbname, rawstmt):
+        super().__init__('MaterializedView', dbname, rawstmt)
 
         self.as_select = ''
         self.fr = ''
@@ -492,8 +498,8 @@ class View(Table):
         # heuristic: remove explicit 'default.' in from-table
         self.as_select = re.sub(r'FROM [a-zA-Z0-9_]*\.', 'FROM ', self.as_select)
 
-    def scan(self, create_table_query):
-        self._parse_create_statement(*tokenize_sql(create_table_query))
+    def scan(self, create_query):
+        self._parse_create_statement(*tokenize_sql(create_query))
         return self
 
     def read(self, s, t):
@@ -531,8 +537,8 @@ class Buffer(Table):
     
     check engine parameters, target database and table (from engine arguments)
     '''
-    def __init__(self, dbname):
-        super().__init__('Buffer', dbname)
+    def __init__(self, dbname, rawstmt):
+        super().__init__('Buffer', dbname, rawstmt)
 
         self.to = None
         self.parameters = {}
@@ -596,8 +602,8 @@ class Dist(Table):
 
     check source database and table from engine arguments
     '''
-    def __init__(self, dbname):
-        super().__init__('Dist', dbname)
+    def __init__(self, dbname, rawstmt):
+        super().__init__('Dist', dbname, rawstmt)
 
         self.fr = ''
 
@@ -651,11 +657,11 @@ class Null(Table):
 
     check columns
     '''
-    def __init__(self, dbname):
-        super().__init__('Null', dbname)
+    def __init__(self, dbname, rawstmt):
+        super().__init__('Null', dbname, rawstmt)
 
-    def scan(self, create_table_query):
-        self._parse_columns(*tokenize_sql(create_table_query))
+    def scan(self, create_query):
+        self._parse_columns(*tokenize_sql(create_query))
         return self
 
     def read(self, s, t):
@@ -679,11 +685,11 @@ class TinyLog(Table):
 
     check columns
     '''
-    def __init__(self, dbname):
-        super().__init__('TinyLog', dbname)
+    def __init__(self, dbname, rawstmt):
+        super().__init__('TinyLog', dbname, rawstmt)
 
-    def scan(self, create_table_query):
-        self._parse_columns(*tokenize_sql(create_table_query))
+    def scan(self, create_query):
+        self._parse_columns(*tokenize_sql(create_query))
         return self
 
     def read(self, s, t):
@@ -707,8 +713,8 @@ class Keeper(Table):
 
     check columns and node path
     '''
-    def __init__(self, dbname):
-        super().__init__('Keeper', dbname)
+    def __init__(self, dbname, rawstmt):
+        super().__init__('Keeper', dbname, rawstmt)
 
         self.node_path = ''
 
@@ -721,9 +727,9 @@ class Keeper(Table):
 
         self.node_path = node_path
 
-    def scan(self, engine_full, create_table_query):
+    def scan(self, engine_full, create_query):
         self._parse_path(*tokenize_sql(engine_full))
-        self._parse_columns(*tokenize_sql(create_table_query))
+        self._parse_columns(*tokenize_sql(create_query))
         return self
 
     def read(self, s, t):
@@ -751,8 +757,8 @@ class Dictionary(Table):
 
     check columns, primary key, source, layout and lifetime
     '''
-    def __init__(self, dbname):
-        super().__init__('Dictionary', dbname)
+    def __init__(self, dbname, rawstmt):
+        super().__init__('Dictionary', dbname, rawstmt)
 
         self.primary_key = ''
         self.source = ''
@@ -864,8 +870,8 @@ class Dictionary(Table):
         self.layout = untokenize(s, layout)
         self.lifetime = self._parse_lifetime(s, lifetime)
 
-    def scan(self, create_table_query):
-        (s, t) = tokenize_sql(create_table_query)
+    def scan(self, create_query):
+        (s, t) = tokenize_sql(create_query)
         self._parse_create_statement(s, t)
         self._parse_columns(s, t)
         return self
@@ -905,8 +911,8 @@ class Kafka(Table):
 
     check broker list, topic list, format and settings
     '''
-    def __init__(self, dbname):
-        super().__init__('Kafka', dbname)
+    def __init__(self, dbname, rawstmt):
+        super().__init__('Kafka', dbname, rawstmt)
 
         self.brokers = []
         self.topics = []
@@ -958,8 +964,8 @@ class Kafka(Table):
                             (setting, format_numeric_constant(x.string))
                         setting = ''
 
-    def scan(self, create_table_query):
-        self._parse_engine(*tokenize_sql(create_table_query))
+    def scan(self, create_query):
+        self._parse_engine(*tokenize_sql(create_query))
         return self
 
     def read(self, s, t):
@@ -1390,27 +1396,29 @@ class Model(object):
             self.mt | self.mv | self.view | self.buffer | self.dist | \
             self.null | self.tiny | self.keeper | self.dictionary | self.kafka
 
-    def _scan_table(self, dbname, engine,  engine_full, create_table_query):
+    def _scan_table(self, dbname, engine,  engine_full, create_query):
+        r, s = self._preprocess(create_query)
+        print('+preprocess "%s" -> "%s"' % (r, s))
         if engine.endswith('MergeTree'):
-            self.mt[dbname] = MT(dbname, engine).scan(engine_full, create_table_query)
+            self.mt[dbname] = MT(engine, dbname, r).scan(engine_full, s)
         elif engine == 'MaterializedView':
-            self.mv[dbname] = MV(dbname).scan(create_table_query)
+            self.mv[dbname] = MV(dbname, r).scan(s)
         elif engine == 'View':
-            self.view[dbname] = View(dbname).scan(create_table_query)
+            self.view[dbname] = View(dbname, r).scan(s)
         elif engine == 'Buffer':
-            self.buffer[dbname] = Buffer(dbname).scan(engine_full)
+            self.buffer[dbname] = Buffer(dbname, r).scan(engine_full)
         elif engine == 'Distributed':
-            self.dist[dbname] = Dist(dbname).scan(engine_full)
+            self.dist[dbname] = Dist(dbname, r).scan(engine_full)
         elif engine == 'Null':
-            self.null[dbname] = Null(dbname).scan(create_table_query)
+            self.null[dbname] = Null(dbname, r).scan(s)
         elif engine == 'TinyLog':
-            self.tiny[dbname] = TinyLog(dbname).scan(create_table_query)
+            self.tiny[dbname] = TinyLog(dbname, r).scan(s)
         elif engine == 'KeeperMap':
-            self.keeper[dbname] = Keeper(dbname).scan(engine_full, create_table_query)
+            self.keeper[dbname] = Keeper(dbname, r).scan(engine_full, s)
         elif engine == 'Dictionary':
-            self.dictionary[dbname] = Dictionary(dbname).scan(create_table_query)
+            self.dictionary[dbname] = Dictionary(dbname, r).scan(s)
         elif engine == 'Kafka':
-            self.kafka[dbname] = Kafka(dbname).scan(create_table_query)
+            self.kafka[dbname] = Kafka(dbname, r).scan(s)
         elif engine == 'PostgreSQL':
             # silently ignore PostgreSQL engine
             # (virtual tables dynamically populated in PostgreSQL database)
@@ -1460,30 +1468,32 @@ class Model(object):
             if name != 'default': # heuristic: skip the built-in quota
                 self.quotas[name] = Quota(name).scan(client)
 
-        for (db, table, engine, engine_full, create_table_query) in client.execute('''
+        for (db, table, engine, engine_full, create_query) in client.execute('''
             SELECT database, name, engine, engine_full, create_table_query
             FROM system.tables WHERE NOT database IN
             ['information_schema', 'INFORMATION_SCHEMA', 'system']
             '''):
             self._scan_table('%s.%s' % (db, table),
-                engine, engine_full, create_table_query)
+                engine, engine_full, create_query)
 
         self._verify_dependencies()
         return self
     
     def _preprocess(self, statement):
         # formatted
-        s = sqlparse.format(statement, **sqlparse_format)
+        r = sqlparse.format(statement, **sqlparse_format)
 
         # without trailing semicolons
-        s = s.rstrip(';')
+        r = r.rstrip(';')
 
-        # whitespace collapsed
-        s = re.sub(r'\s+', ' ', s.strip())
+        # whitespace-collapsed
+        s = re.sub(r'\s+', ' ', r.strip())
 
         s = s.replace(' IF NOT EXISTS ', ' ')
 
-        return s
+        # return raw statement before whitespace collapsing
+        # as well as collapsed line
+        return r, s
 
     def _read_dbname(self, t):
         if t[1].exact_type == token.DOT:
@@ -1506,7 +1516,7 @@ class Model(object):
                 return x.string
         return None
 
-    def _read_create_statement(self, s, t):
+    def _read_create_statement(self, r, s, t):
         if t[1].string == 'MATERIALIZED' and t[2].string == 'VIEW':
             dbname = self._read_dbname(t[3:])
             entity = 'MaterializedView'
@@ -1535,25 +1545,25 @@ class Model(object):
             return
 
         if entity.endswith('MergeTree'):
-            self.mt[dbname] = MT(dbname, entity).read(s, t)
+            self.mt[dbname] = MT(entity, dbname, r).read(s, t)
         elif entity == 'MaterializedView':
-            self.mv[dbname] = MV(dbname).read(s, t)
+            self.mv[dbname] = MV(dbname, r).read(s, t)
         elif entity == 'View':
-            self.view[dbname] = View(dbname).read(s, t)
+            self.view[dbname] = View(dbname, r).read(s, t)
         elif entity == 'Buffer':
-            self.buffer[dbname] = Buffer(dbname).read(s, t)
+            self.buffer[dbname] = Buffer(dbname, r).read(s, t)
         elif entity == 'Distributed':
-            self.dist[dbname] = Dist(dbname).read(s, t)
+            self.dist[dbname] = Dist(dbname, r).read(s, t)
         elif entity == 'Null':
-            self.null[dbname] = Null(dbname).read(s, t)
+            self.null[dbname] = Null(dbname, r).read(s, t)
         elif entity == 'TinyLog':
-            self.tiny[dbname] = TinyLog(dbname).read(s, t)
+            self.tiny[dbname] = TinyLog(dbname, r).read(s, t)
         elif entity == 'KeeperMap':
-            self.keeper[dbname] = Keeper(dbname).read(s, t)
+            self.keeper[dbname] = Keeper(dbname, r).read(s, t)
         elif entity == 'Dictionary':
-            self.dictionary[dbname] = Dictionary(dbname).read(s, t)
+            self.dictionary[dbname] = Dictionary(dbname, r).read(s, t)
         elif entity == 'Kafka':
-            self.kafka[dbname] = Kafka(dbname).read(s, t)
+            self.kafka[dbname] = Kafka(dbname, r).read(s, t)
         elif entity == 'User':
             self.users[name] = User(name).read(s, t)
         elif entity == 'Role':
@@ -1568,9 +1578,9 @@ class Model(object):
         self.grants.setdefault(grant.grantee, Grants())
         self.grants[grant.grantee].append(grant)
 
-    def _read_statement(self, s, t):
+    def _read_statement(self, r, s, t):
         if t[0].string == 'CREATE':
-            self._read_create_statement(s, t)
+            self._read_create_statement(r, s, t)
         elif t[0].string == 'GRANT':
             self._read_grant_statement(s, t)
 
@@ -1578,8 +1588,8 @@ class Model(object):
         for file in files:
             with open(file) as fd:
                 for statement in sqlparse.split(fd.read()):
-                    s = self._preprocess(statement)
-                    self._read_statement(s,
+                    r, s = self._preprocess(statement)
+                    self._read_statement(r, s,
                         list(tokenize.generate_tokens(io.StringIO(s).readline)))
 
         return self
@@ -1629,6 +1639,8 @@ remarks:
 
     repo = Model().read(files)
 
+    raw_diff = True
+
     def diff(iterable, left, right, kind):
         longest_name = \
             len(max(iterable.keys(), key=len)) + 2 if len(iterable) else ''
@@ -1640,10 +1652,14 @@ remarks:
                 print('no such %s found' % kind)
                 continue
 
-            ret = left[i].diff(right[i])
-            if len(ret) > 0:
-                print(', '.join(ret))
-                continue
+            if raw_diff and kind in ['table']:
+                ret = left[i].raw_diff(right[i])
+                print(ret)
+            else:
+                ret = left[i].diff(right[i])
+                if len(ret) > 0:
+                    print(', '.join(ret))
+                    continue
 
             print('OK')
 
