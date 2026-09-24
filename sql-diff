@@ -1624,7 +1624,6 @@ remarks:
         except:
             password = ''
         credentials = (os.getenv('SQL_DIFF_USERNAME', 'default'), password)
-        print('credentials=', credentials)
         host = sys.argv[1]
         files = sys.argv[2:]
 
