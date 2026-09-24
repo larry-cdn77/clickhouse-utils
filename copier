@@ -20,7 +20,8 @@ copy FOO table on ALICE to BAR table on BOB
   - DAY argument against TIMESTAMP column
   - validate by counting AGGREGATE expression, success means abs(a-b)/a < RATIO
   - delete, validate and insert one hour at a time
-  - username 'copier' with password read from \$HOME/.copier
+  - local authentication: 'copier' user, password from \$HOME/.copier file
+  - remote authentication: 'copier' named collection
 
 OPTIONS
 
@@ -44,7 +45,7 @@ remarks:
 
 example:
 
-  $0 copier bob txns txns ts sumMerge\\\\(val\\\\) 0.01 2026-09-01" 1>&2
+  $0 alice bob txns txns ts sumMerge\\\\(val\\\\) 0.01 2026-09-01" 1>&2
   exit 2
 fi
 
@@ -72,7 +73,6 @@ function sanitise() {
   python3 <(cat <<EOF
 import sys
 sys.stdout.write(sys.stdin.read(). \\
-  replace('$pswd', 'HIDDEN'). \\
   replace('$hsrc', 'alice'))
 EOF
   )
@@ -93,12 +93,9 @@ fi
 
 # check access to source from destination through remote function
 if ! client -h $hdst -q "
-  SELECT count() FROM (
-    SELECT * FROM remote(
-      '$hsrc', 'system', 'numbers', '$user', '$pswd'
-    ) LIMIT 10
-  )
-" | grep '\<10\>' -q ; then
+  SELECT count() FROM remoteSecure(copier,
+    host='$hsrc', database='system', table='zookeeper_connection')
+" | grep '\<1\>' -q ; then
   print remote access failed
   exit 1
 fi
@@ -336,9 +333,8 @@ for hh in {00..23} ; do
       if ! print "
         INSERT INTO $tdst
         SETTINGS insert_deduplicate = 0
-        SELECT * FROM remote(
-          '$hsrc', '$database', '$tsrc', '$user', '$pswd'
-        )
+        SELECT * FROM remoteSecure(copier,
+          host='$hsrc', database='$database', table='$tsrc')
         WHERE toStartOfHour($timestamp) = '$day $hh:00:00'
       " | oneline | client -h $hdst --echo | sanitise ; then
         print insert error
