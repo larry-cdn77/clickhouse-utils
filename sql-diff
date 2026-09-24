@@ -1444,7 +1444,7 @@ class Model(object):
             name = enumerated[i]
             assert re.search(name, stmt)
             self.roles[name] = Role(name).scan(stmt)
-            i ++ 1
+            i += 1
 
         for (stmt,) in client.execute('SHOW GRANTS FOR ALL'):
             grant = Grant().scan(stmt)
