@@ -1596,6 +1596,7 @@ one or more FILEs contain CREATE statements to diff against
 
 remarks:
 - port number in HOST is excluded (9000 will be used)
+- credentials via -u/-p or env. variables SQL_DIFF_USERNAME and SQL_DIFF_PASSWORD_FILE
 - has no way of checking user passwords
 - SHOW DATABASES/TABLES permission determines tables to check
 - reverse mode iterates over create statements in files rather than live target
