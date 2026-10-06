@@ -603,14 +603,14 @@ class Dist(Table):
         self.fr = ''
 
     def _parse_engine(self, s, t):
-        state = 0 # 1 = (, 2 = first comma, 3 = second comma
+        state = 0 # 1 = (, 2 = first comma, 3 = second comma, 4 = third comma
         db, name = 'default', '' # default when currentDatabase() used
         for x in t:
             if x.exact_type == token.LPAR:
                 if state == 0:
                     state = 1
             elif x.exact_type == token.COMMA:
-                if state in [1, 2]:
+                if state in [1, 2, 3]:
                     state += 1
             elif x.type == token.STRING:
                 if state == 2:
