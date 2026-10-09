@@ -78,19 +78,41 @@ def bool_as_integer(val):
         return val
 
 def extract_name_plain_or_backticks(s, t):
-    state = 0 # 4 = NAME (plain),
-              # 1 = first ERRORTOKEN,
-              # 2 = second ERRORTOKEN (opening backtick),
-              # 3 = third ERRORTOKEN (closing backtick),
+    state = 0 # 1 = leading ERRORTOKEN space (Python 3.9 weirdness),
+              # 2 = opening ERRORTOKEN or OP backtick (Python 3.12 uses OP),
+              # 3 = closing ERRORTOKEN or OP backtick,
+              # 4 = NAME (plain)
     name = ''
     for x in t:
-        if x.type == token.NAME:
+        if x.type == token.ERRORTOKEN:
+            if state == 0:
+                if x.string == ' ':
+                    state = 1
+                elif x.string == '`':
+                    state = 2
+            elif state == 1:
+                if x.string == '`':
+                    state = 2
+            elif state == 2:
+                if x.string == '`':
+                    state = 3
+                else:
+                    name += x.string
+        elif x.type == token.OP:
+            if state == 0:
+                if x.string == '`':
+                    state = 2
+            elif state == 2:
+                if x.string == '`':
+                    state = 3
+                else:
+                    name += x.string
+        elif x.type == token.NAME:
             if state == 0:
                 name = x.string
                 state = 4
-        if x.exact_type == token.ERRORTOKEN:
-            if state in [0, 1, 2]:
-                state += 1
+            elif state == 2:
+                name += x.string
         else:
             if state == 2:
                 name += x.string
