@@ -171,8 +171,8 @@ class Table(object):
             if level >= 1:
                 column += [x]
 
-        # work around what appear untokenize including backquotes presumably
-        # as it considers them parsing errors (ERRORTOKEN)
+        # remove backquotes in table definition for convenient parsing
+        # also Python older than 3.12 returns them as ERRORTOKEN
         for i in range(len(self.columns)):
             self.columns[i] = self.columns[i].replace('`', '')
 
@@ -1281,9 +1281,9 @@ class Role():
                             (setting, bool_as_integer(x.string))
                         setting = ''
             elif state == 1:
-                # ERRORTOKEN takes care of backticks
+                # backquotes are ERRORTOKEN until Python 3.12, then OP
                 if x.exact_type not in [
-                    token.ERRORTOKEN, token.EQUAL, token.COMMA, token.ENDMARKER, token.NEWLINE]:
+                    token.OP, token.ERRORTOKEN, token.EQUAL, token.COMMA, token.ENDMARKER, token.NEWLINE]:
                     self.settings[setting] = '%s=%s' % \
                         (setting, format_numeric_constant(x.string))
                     setting = ''
@@ -1352,9 +1352,9 @@ class User():
                     state = 4
             else:
                 if state == 4:
-                    # ERRORTOKEN takes care of backticks
+                    # backquotes are ERRORTOKEN until Python 3.12, then OP
                     if x.exact_type not in [
-                        token.ERRORTOKEN, token.EQUAL, token.COMMA, token.ENDMARKER, token.NEWLINE]:
+                        token.OP, token.ERRORTOKEN, token.EQUAL, token.COMMA, token.ENDMARKER, token.NEWLINE]:
                         self.settings[setting] = '%s=%s' % \
                             (setting, format_numeric_constant(x.string))
                         setting = ''
