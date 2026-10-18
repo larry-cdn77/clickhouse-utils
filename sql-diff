@@ -1653,7 +1653,7 @@ remarks:
     port = 9440 if secure else 9000
 
     live = Model().scan(clickhouse_driver.Client(host=host,
-        port=port, secure=secure,
+        port=port, secure=secure, verify=False,
         user=credentials[0], password=credentials[1]))
 
     repo = Model().read(files)
