@@ -1645,7 +1645,9 @@ remarks:
             with open(os.getenv('SQL_DIFF_PASSWORD_FILE')) as f:
                 password = f.read()
         except:
-            password = ''
+            print('failed to read from SQL_DIFF_PASSWORD_FILE (%s)' % \
+                    os.getenv('SQL_DIFF_PASSWORD_FILE'), file=sys.stderr)
+            sys.exit(1)
         credentials = (os.getenv('SQL_DIFF_USERNAME', 'default'), password)
         host = sys.argv[1]
         files = sys.argv[2:]
